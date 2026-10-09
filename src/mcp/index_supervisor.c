@@ -673,6 +673,31 @@ static bool worker_result_succeeded(const cbm_index_worker_result_t *result) {
            result->tree_quiesced && !result->supervision_failed;
 }
 
+/* Did this run publish its index?
+ *
+ * The supervisor deletes the worker log as scratch once it is no longer the
+ * only record of the run. That is true only when the run PUBLISHED: the
+ * response then carries "indexed" (or "degraded", which also publishes) and the
+ * outcome is recorded there. Every other status -- aborted_previous_preserved
+ * (#2020), error, persist_failed -- means the previous index is still serving
+ * and this log is the ONLY place the cause was written down.
+ *
+ * THE EXIT CODE CANNOT DECIDE THIS. An abort is a status, not a crash: the
+ * worker exits ZERO, so the old rule deleted the log for exactly the runs that
+ * needed it, while the response told the caller to "check the run log".
+ * Measured on a 146-file repository: the first index aborted after 7m29s and
+ * the reason was unrecoverable; re-running under CBM_PROFILE=1 was the only way
+ * to keep it.
+ *
+ * A raw substring probe is deliberate, as elsewhere in this codebase: the JSON
+ * is machine-written and compact (yyjson write flag 0), and parsing it here
+ * would cost more than it saves. If the shape ever changes the probe misses,
+ * which KEEPS the log -- the safe direction. */
+static bool worker_response_published(const char *response) {
+    return response != NULL && (strstr(response, "\"status\":\"indexed\"") != NULL ||
+                                strstr(response, "\"status\":\"degraded\"") != NULL);
+}
+
 static void worker_terminal_log(cbm_index_worker_handle_t *handle) {
     char signal_text[16];
     char exit_text[16];
@@ -708,10 +733,18 @@ static void worker_terminal_log(cbm_index_worker_handle_t *handle) {
         /* #1300: keep and name the log — it is the only record of the run. */
         cbm_log_error("index.supervisor.no_response", "exit_code", exit_text, "last_phase",
                       handle->result.last_phase, "log", handle->log_path);
-    } else if (handle->result.outcome == CBM_PROC_CLEAN && !cbm_profile_active) {
-        (void)cbm_unlink(handle->log_path);
     } else if (handle->result.outcome == CBM_PROC_CLEAN) {
-        cbm_log_info("index.supervisor.profile_log", "log", handle->log_path);
+        /* CLEAN is not the same as SUCCESS, and the exit code cannot tell them
+         * apart: an abort exits zero. Delete the log only when the run actually
+         * published; otherwise it is the only record of why the index was left
+         * untouched. */
+        if (!cbm_profile_active && worker_response_published(handle->result.response)) {
+            (void)cbm_unlink(handle->log_path);
+        } else {
+            cbm_log_warn("index.supervisor.kept_log", "log", handle->log_path, "reason",
+                         worker_response_published(handle->result.response) ? "profiling"
+                                                                            : "not_published");
+        }
     } else {
         cbm_log_warn("index.supervisor.worker_failed", "outcome",
                      cbm_proc_outcome_str(handle->result.outcome), "exit_code", exit_text, "log",
