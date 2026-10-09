@@ -220,6 +220,18 @@ struct cbm_pipeline {
     int ignored_count;
     int ignored_total;
 
+    /* Why the LLM enrichment pass DECLINED to work, when it declined rather
+     * than ran: the projected file count against the ceiling, or the dry-run
+     * projection. Empty when the pass ran normally or was not enabled.
+     *
+     * This rides the RESULT rather than the log because the indexing worker's
+     * log file is unlinked on a clean exit (index_supervisor.c), so a warning
+     * written there is destroyed before anyone can read it -- and a guard
+     * nobody can see is indistinguishable from a bug. One short line, set at
+     * most once per run, hence a fixed buffer. */
+    char llm_notice_kind[CBM_SZ_32];
+    char llm_notice[CBM_SZ_256];
+
     /* Per-file indexing failures (skipped files) surfaced via MCP/CLI/logfile
      * (Stage 2 / Track B). A skip is the expected handled outcome of a bad or
      * oversized file — the run still succeeds ("indexed"). Owned by the
@@ -1228,6 +1240,24 @@ void cbm_pipeline_get_file_errors(const cbm_pipeline_t *p, cbm_file_error_t **ou
     if (count) {
         *count = p ? p->file_errors_count : 0;
     }
+}
+
+/* Published by the LLM enrichment pass when it declines to run. See the field
+ * comment in struct cbm_pipeline for why this cannot be a log line. */
+void cbm_pipeline_set_llm_notice(cbm_pipeline_t *p, const char *kind, const char *detail) {
+    if (!p) {
+        return;
+    }
+    (void)snprintf(p->llm_notice_kind, sizeof(p->llm_notice_kind), "%s", kind ? kind : "");
+    (void)snprintf(p->llm_notice, sizeof(p->llm_notice), "%s", detail ? detail : "");
+}
+
+const char *cbm_pipeline_llm_notice_kind(const cbm_pipeline_t *p) {
+    return p ? p->llm_notice_kind : "";
+}
+
+const char *cbm_pipeline_llm_notice(const cbm_pipeline_t *p) {
+    return p ? p->llm_notice : "";
 }
 
 void cbm_pipeline_get_ignored(const cbm_pipeline_t *p, cbm_ignored_file_t **out, int *count,

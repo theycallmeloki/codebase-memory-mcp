@@ -158,6 +158,20 @@ void cbm_pipeline_add_file_error(cbm_pipeline_t *p, const char *path, const char
  * nothing was skipped. Do not free. */
 void cbm_pipeline_get_file_errors(const cbm_pipeline_t *p, cbm_file_error_t **out, int *count);
 
+/* Published by the LLM enrichment pass when it declines to run, so that an
+ * index that comes back without prose explains itself. kind is a short
+ * machine-readable token ("over_budget" or "dry_run"); detail is the line to
+ * show the operator. Both are copied, and the accessors hand back borrowed
+ * pointers ("" when the pass ran normally or was not enabled).
+ *
+ * This travels through the result rather than the log because the indexing
+ * worker's log file is unlinked on a clean exit, so a warning written there
+ * never reaches anyone -- and a guard nobody can see is indistinguishable
+ * from a bug. */
+void cbm_pipeline_set_llm_notice(cbm_pipeline_t *p, const char *kind, const char *detail);
+const char *cbm_pipeline_llm_notice_kind(const cbm_pipeline_t *p);
+const char *cbm_pipeline_llm_notice(const cbm_pipeline_t *p);
+
 /* Borrowed accessor for the individually-ignored files captured during
  * discovery (#963 "purposely not indexed" — by design, not failures). count
  * is the stored (capped) length, total the uncapped number seen. Do not

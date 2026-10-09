@@ -45,6 +45,13 @@
  *     CBM_LLM_MAX_BYTES   file-content cap sent per file, default 65536. A file
  *                         larger than the cap is sent CUT, with an explicit
  *                         truncation notice in the prompt, never silently.
+ *     CBM_LLM_MAX_FILES   ceiling on files attempted in one run, default 1000.
+ *                         A run that would exceed it spends NOTHING and logs
+ *                         llm_enrich.skip with the projection and the remedy,
+ *                         rather than enriching a prefix. 0 removes the ceiling.
+ *     CBM_LLM_DRY_RUN     1 => report how many files would be enriched and how
+ *                         many bytes that could put on the wire, then make no
+ *                         calls at all. For sizing a repository up front.
  *
  * The bearer token never appears on argv: /proc/<pid>/cmdline is world
  * readable, so it is passed to curl through a 0600 config file that is
@@ -87,12 +94,14 @@ enum {
 /* ── configuration ──────────────────────────────────────────────────────── */
 
 typedef struct {
-    bool on; /* false => no model configured; stub prose, no network */
+    bool on;      /* false => no model configured; stub prose, no network */
+    bool dry_run; /* report the projected work, spend nothing */
     char url[CBM_PATH_MAX];
     char key[CBM_PATH_MAX];
     char model[128];
     int timeout_ms;
     long max_bytes;
+    long max_files; /* ceiling on files attempted in one run; 0 => none */
 } enrich_cfg_t;
 
 /* cbm_safe_getenv returns either the caller's buffer or the fallback, so the
@@ -117,6 +126,20 @@ static void enrich_cfg_load(enrich_cfg_t *c) {
     enrich_env("CBM_LLM_MAX_BYTES", "65536", num, sizeof(num));
     long cap = atol(num);
     c->max_bytes = cap > 0 ? cap : 65536;
+
+    /* COST GUARD. This defaults to a CEILING rather than to unlimited, because
+     * the pass spends one model call per file lacking prose and the repos big
+     * enough for that to hurt are exactly the ones where nobody notices until
+     * the invoice or the wall clock arrives. 0 disables the ceiling outright;
+     * a run that hits it spends nothing and says so, with the remedy. */
+    enrich_env("CBM_LLM_MAX_FILES", "1000", num, sizeof(num));
+    long maxf = atol(num);
+    c->max_files = maxf > 0 ? maxf : 0;
+
+    /* Report what the pass WOULD spend, then stop, so a large repository can
+     * be sized before committing to the call volume. */
+    enrich_env("CBM_LLM_DRY_RUN", "0", num, sizeof(num));
+    c->dry_run = num[0] == '1';
 
     /* A key is NOT required: a local server usually wants none. The URL is what
      * decides whether the pass talks to anything at all. */
@@ -596,6 +619,66 @@ int cbm_pipeline_pass_llm_enrich(cbm_pipeline_ctx_t *ctx) {
 
     enrich_cfg_t cfg;
     enrich_cfg_load(&cfg);
+
+    /* ── cost guard ───────────────────────────────────────────────────────
+     * One model call per file that lacks prose, so the spend scales with the
+     * size of the repository. Size the work BEFORE doing any of it: an
+     * accidental run over a monorepo should report its own size rather than
+     * quietly buy it.
+     *
+     * The count is an upper bound on calls, not a forecast. Files whose content
+     * is already in the cache cost nothing, and this deliberately does not
+     * consult the cache: discovering that would mean reading and hashing every
+     * file up front, which is the work the guard exists to avoid. Erring high
+     * is the safe direction for a ceiling.
+     *
+     * Stub mode (no CBM_LLM_URL) makes no call and spends nothing, so it is
+     * not guarded. */
+    if (cfg.on) {
+        int need = 0;
+        for (int i = 0; i < file_count; i++) {
+            const cbm_gbuf_node_t *node = files[i];
+            if (node && node->file_path && !enrich_already_done(node)) {
+                need++;
+            }
+        }
+        char n_need[CBM_SZ_16];
+        (void)snprintf(n_need, sizeof(n_need), "%d", need);
+
+        if (cfg.dry_run) {
+            char n_bytes[CBM_SZ_32];
+            char detail[CBM_SZ_256];
+            (void)snprintf(n_bytes, sizeof(n_bytes), "%lld",
+                           (long long)need * (long long)cfg.max_bytes);
+            (void)snprintf(detail, sizeof(detail),
+                           "dry run: would enrich %s file(s), up to %s bytes on the wire. "
+                           "No model calls were made.",
+                           n_need, n_bytes);
+            /* The notice is what the operator sees; the log line is for a
+             * profiling run, where the worker log survives. */
+            cbm_pipeline_set_llm_notice(ctx->pipeline, "dry_run", detail);
+            cbm_log_warn("llm_enrich.dry_run", "model", cfg.model, "would_enrich", n_need,
+                         "worst_case_bytes", n_bytes);
+            return 0;
+        }
+        if (cfg.max_files > 0 && (long)need > cfg.max_files) {
+            /* Refuse wholesale rather than enriching a prefix: an index that is
+             * half prose is harder to reason about than one with none, and the
+             * remedy is the same either way. */
+            char n_cap[CBM_SZ_16];
+            char detail[CBM_SZ_256];
+            (void)snprintf(n_cap, sizeof(n_cap), "%ld", cfg.max_files);
+            (void)snprintf(detail, sizeof(detail),
+                           "cost guard: %s file(s) need prose but CBM_LLM_MAX_FILES is %s, so "
+                           "nothing was enriched and no model calls were made. Raise the "
+                           "ceiling (0 disables it) and re-index.",
+                           n_need, n_cap);
+            cbm_pipeline_set_llm_notice(ctx->pipeline, "over_budget", detail);
+            cbm_log_warn("llm_enrich.skip", "reason", "over_budget", "projected", n_need, "cap",
+                         n_cap, "hint", "raise CBM_LLM_MAX_FILES, or 0 for no ceiling");
+            return 0;
+        }
+    }
 
     char fields[ENRICH_FIELD_COUNT][ENRICH_VALUE_CAP];
     int enriched = 0;

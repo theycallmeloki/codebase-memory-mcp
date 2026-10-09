@@ -10601,6 +10601,23 @@ static bool write_skip_logfile(const char *project, const cbm_file_error_t *errs
     return true;
 }
 
+/* Attach the LLM enrichment pass's notice when it declined to work.
+ *
+ * Present only when the pass skipped: either the cost guard tripped or a dry
+ * run was requested. Without this the operator sees an index that simply has no
+ * prose and no reason for it -- and the pass cannot log it, because the worker
+ * log is unlinked on a clean exit. */
+static void add_llm_notice(yyjson_mut_doc *doc, yyjson_mut_val *root, cbm_pipeline_t *p) {
+    const char *kind = cbm_pipeline_llm_notice_kind(p);
+    if (!kind || !kind[0]) {
+        return;
+    }
+    yyjson_mut_val *n = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_strcpy(doc, n, "kind", kind);
+    yyjson_mut_obj_add_strcpy(doc, n, "detail", cbm_pipeline_llm_notice(p));
+    yyjson_mut_obj_add_val(doc, root, "llm_enrich", n);
+}
+
 /* Build the success portion of the index_repository response.
  * Returns true when status should be "degraded" (#334 plausibility gate). */
 static bool build_index_success_response(cbm_mcp_server_t *srv, yyjson_mut_doc *doc,
@@ -10611,6 +10628,7 @@ static bool build_index_success_response(cbm_mcp_server_t *srv, yyjson_mut_doc *
                                          const char *logfile) {
     add_excluded_summary(doc, root, excluded_dirs, excluded_count);
     add_not_indexed_files_summary(doc, root, p);
+    add_llm_notice(doc, root, p);
 
     int exp_nodes = -1;
     int exp_edges = -1;
