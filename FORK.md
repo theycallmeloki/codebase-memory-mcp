@@ -48,6 +48,50 @@ The API key is never passed on a command line: it goes to `curl` through a
 `0600` config file that is unlinked the moment the request returns, so it cannot
 be read out of `/proc/<pid>/cmdline`.
 
+### Making the credentials actually reach the pass
+
+Setting these in your shell is **not enough**, and this bites people silently.
+
+The MCP server is not started by your shell — it is started by whichever agent
+hosts it (omp, Claude Code, Codex, OpenCode, Cursor, …). Nothing you export
+interactively reaches it. And the server starts a **long-lived daemon** that
+serves every later index request with *its own* environment, so exporting the
+variables after a daemon is already running changes nothing at all — including
+for a brand-new file.
+
+When the daemon has no `CBM_LLM_URL`, indexing still succeeds but every file
+gets placeholder prose (`stub purpose: <path> is a <py> source file`) instead of
+a description, and that text goes into the BM25 body of every file it touches.
+The index result says so (`llm_enrich.kind == "stub"`), but only if you look.
+
+`scripts/cbm-wire-llm.sh` fixes this. It writes a small wrapper that sources
+your credentials file and execs the real binary, then points each client's MCP
+`command` at that wrapper. The secret therefore stays in **one** file
+(`~/.cbm-llm.env` by default) rather than being copied into every client config,
+which is what per-client `env` blocks would require.
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/theycallmeloki/codebase-memory-mcp/main/scripts/cbm-wire-llm.sh \
+  | bash -s -- --dry-run     # see what it would change
+cbm-wire-llm                 # do it
+```
+
+Then **restart your agent sessions** — a running daemon keeps the environment it
+was started with. To check which environment is actually live:
+
+```sh
+pid=$(pgrep -f cbm-daemon-internal | head -1)
+tr '\0' '\n' < /proc/$pid/environ | grep CBM_LLM
+```
+
+`CBM_LLM_URL` should be there. If it is not, that daemon predates the wiring.
+
+Re-run `cbm-wire-llm` after any `install` — the installer rewrites the client
+configs back to the bare binary path, which silently un-wires this. It is
+idempotent, it backs each config up once (`.bak-cbm-llm`) on first change, and
+`cbm-wire-llm --revert` restores them. `update` is safe: it replaces the binary,
+not the wrapper.
+
 ## Cost model
 
 - One model call per file that lacks prose, so spend scales with repository size.
