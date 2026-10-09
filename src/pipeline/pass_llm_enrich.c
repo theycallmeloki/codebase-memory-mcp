@@ -716,7 +716,22 @@ int cbm_pipeline_pass_llm_enrich(cbm_pipeline_ctx_t *ctx) {
                  "skipped", n_skipped);
     if (failed > 0) {
         char n_failed[CBM_SZ_16];
+        char n_attempted[CBM_SZ_16];
+        char detail[CBM_SZ_256];
         (void)snprintf(n_failed, sizeof(n_failed), "%d", failed);
+        (void)snprintf(n_attempted, sizeof(n_attempted), "%d", enriched + failed);
+        /* Surfaced through the result for the same reason the guard is: this is
+         * an INFO line, a CLI run suppresses INFO, and the worker's log file is
+         * unlinked on a clean exit. Without it, a run that enriched 200 files
+         * and failed on 70 is indistinguishable from one that enriched 200 of
+         * 200 -- the index simply has less prose than it should, and nothing
+         * anywhere says so. */
+        (void)snprintf(detail, sizeof(detail),
+                       "%s of %s file(s) could not be enriched; the rest of the index is "
+                       "unaffected. Re-index to retry -- files that succeeded are cached and "
+                       "cost nothing.",
+                       n_failed, n_attempted);
+        cbm_pipeline_set_llm_notice(ctx->pipeline, "partial", detail);
         cbm_log_info("llm_enrich.partial", "failed", n_failed);
     }
     return 0;
