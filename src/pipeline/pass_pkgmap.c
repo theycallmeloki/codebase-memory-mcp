@@ -1700,6 +1700,11 @@ bool cbm_python_import_binding_contradicts(const CBMImportArray *imports, const 
             /* `import a.b` binds the ROOT package `a`: the callee already
              * spells its own full dotted path (`a.b.f()`). */
             snprintf(full, sizeof(full), "%s", callee_name);
+        } else if (!as && !path_leaf_seg && full[0] != '.' && strcmp(full, imp->local_name) != 0) {
+            /* `import m as y` (the extractor stores module_path `m`, local
+             * `y`; a from-import always spells a dotted path): `y` IS module
+             * `m`, so `y.T` spells `m.T`. */
+            snprintf(full, sizeof(full), "%s%s", imp->module_path, callee_name + root_len);
         }
         /* Otherwise (`from m import x [as y]`) only the import's own module
          * chain is evidence: members reached THROUGH x (`x.objects.create`)
@@ -1713,6 +1718,27 @@ bool cbm_python_import_binding_contradicts(const CBMImportArray *imports, const 
         bound = true;
     }
     return bound;
+}
+
+/* Base-class twin of the #2127 call gate. `class SimpleTestCase(
+ * unittest.TestCase)` under `import unittest` names the STDLIB base; the
+ * registry's same-module suffix fallback (`unittest.TestCase` -> module's
+ * `TestCase`) or a short-name strategy bound it to a same-named PROJECT class
+ * (django: an inheritance cycle SimpleTestCase -> TestCase ->
+ * TransactionTestCase -> SimpleTestCase, plus fabricated OVERRIDEs). An
+ * external import binding (never materialized as an IMPORTS edge) whose
+ * module chain the target does not spell can never be that target, whatever
+ * the registry strategy. Exact metadata import maps remain valid when the
+ * target spells the imported module chain. Every base resolver (sequential
+ * + parallel semantic, cross-LSP pxc) calls this ONE
+ * gate so the venues cannot diverge. Python only. */
+bool cbm_python_external_base_contradicts(CBMLanguage lang, const CBMImportArray *imports,
+                                          const char *base_spelling, const char *base_qn,
+                                          const cbm_gbuf_t *gbuf, const char *project_name,
+                                          const char *rel_path) {
+    return lang == CBM_LANG_PYTHON &&
+           cbm_python_import_binding_contradicts(imports, base_spelling, base_qn, gbuf,
+                                                 project_name, rel_path);
 }
 
 /* #2127: whether a Python import's module lives in this project. Relative
@@ -2060,10 +2086,10 @@ typedef enum {
 /* The File node at exactly `rel_path`, or NULL. Looked up through the name
  * index (File nodes are named by basename) and matched on the full path, so
  * a same-named file in another directory never qualifies. */
-static const cbm_gbuf_node_t *psr4_file_node(const cbm_pipeline_ctx_t *ctx, const char *rel_path) {
+static const cbm_gbuf_node_t *psr4_file_node(const cbm_gbuf_t *gbuf, const char *rel_path) {
     const cbm_gbuf_node_t **hits = NULL;
     int hit_count = 0;
-    if (cbm_gbuf_find_by_name(ctx->gbuf, path_leaf(rel_path), &hits, &hit_count) != 0 || !hits) {
+    if (cbm_gbuf_find_by_name(gbuf, path_leaf(rel_path), &hits, &hit_count) != 0 || !hits) {
         return NULL;
     }
     for (int i = 0; i < hit_count; i++) {
@@ -2084,9 +2110,8 @@ static const cbm_gbuf_node_t *psr4_file_node(const cbm_pipeline_ctx_t *ctx, cons
  * to the namespace bucket, which binds it to whichever file of the namespace
  * came first. `use function` / `use const` name namespace members, not class
  * files, so they are not applicable. */
-static psr4_outcome_t resolve_php_psr4_class(const cbm_pipeline_ctx_t *ctx,
-                                             const char *source_file_qn, const CBMImport *imp,
-                                             const cbm_gbuf_node_t **out) {
+static psr4_outcome_t resolve_php_psr4_class(const cbm_gbuf_t *gbuf, const char *source_file_qn,
+                                             const CBMImport *imp, const cbm_gbuf_node_t **out) {
     *out = NULL;
     CBMHashTable *pkgmap = cbm_pipeline_get_pkgmap();
     if (!pkgmap || imp->kind != CBM_IMPORT_KIND_DEFAULT) {
@@ -2124,7 +2149,7 @@ static psr4_outcome_t resolve_php_psr4_class(const cbm_pipeline_ctx_t *ctx,
                 *c = '/';
             }
         }
-        const cbm_gbuf_node_t *file = psr4_file_node(ctx, rel);
+        const cbm_gbuf_node_t *file = psr4_file_node(gbuf, rel);
         if (file && (!source_file_qn || !file->qualified_name ||
                      strcmp(file->qualified_name, source_file_qn) != 0)) {
             *out = file;
@@ -2132,6 +2157,60 @@ static psr4_outcome_t resolve_php_psr4_class(const cbm_pipeline_ctx_t *ctx,
         }
     }
     return covered ? PSR4_UNRESOLVED : PSR4_NOT_APPLICABLE;
+}
+
+static bool psr4_class_label(const char *label) {
+    return label && (strcmp(label, "Class") == 0 || strcmp(label, "Interface") == 0 ||
+                     strcmp(label, "Trait") == 0 || strcmp(label, "Enum") == 0);
+}
+
+/* The QN of `member` on the class `cls` defined in `file_path`, or NULL when
+ * that file defines no such class or the class has no such member. */
+static const char *psr4_member_in_file(const cbm_gbuf_t *gbuf, const char *file_path,
+                                       const char *cls, const char *member) {
+    const cbm_gbuf_node_t **hits = NULL;
+    int hit_count = 0;
+    if (cbm_gbuf_find_by_name(gbuf, cls, &hits, &hit_count) != 0 || !hits) {
+        return NULL;
+    }
+    for (int i = 0; i < hit_count; i++) {
+        const cbm_gbuf_node_t *c = hits[i];
+        if (!c || !psr4_class_label(c->label) || !c->qualified_name || !c->file_path ||
+            strcmp(c->file_path, file_path) != 0) {
+            continue;
+        }
+        char qn[CBM_SZ_1K];
+        int w = snprintf(qn, sizeof(qn), "%s.%s", c->qualified_name, member);
+        if (w <= 0 || (size_t)w >= sizeof(qn)) {
+            return NULL;
+        }
+        const cbm_gbuf_node_t *m = cbm_gbuf_find_by_qn(gbuf, qn);
+        return m ? m->qualified_name : NULL;
+    }
+    return NULL;
+}
+
+cbm_psr4_member_t cbm_pipeline_psr4_member_qn(const cbm_gbuf_t *gbuf, const char *class_fqn,
+                                              const char *member, const char **out_qn) {
+    *out_qn = NULL;
+    if (!gbuf || !class_fqn || !member || !member[0]) {
+        return CBM_PSR4_MEMBER_NOT_COVERED;
+    }
+    const CBMImport imp = {.module_path = class_fqn, .kind = CBM_IMPORT_KIND_DEFAULT};
+    const cbm_gbuf_node_t *file = NULL;
+    psr4_outcome_t placed = resolve_php_psr4_class(gbuf, NULL, &imp, &file);
+    if (placed == PSR4_NOT_APPLICABLE) {
+        return CBM_PSR4_MEMBER_NOT_COVERED;
+    }
+    /* Covered from here on: composer would load this file or none, so a
+     * missing file, class or member leaves the member unresolved. */
+    if (placed != PSR4_RESOLVED || !file->file_path) {
+        return CBM_PSR4_MEMBER_UNRESOLVED;
+    }
+    const char *cls = strrchr(class_fqn, '\\');
+    cls = cls ? cls + SKIP_ONE : class_fqn;
+    *out_qn = psr4_member_in_file(gbuf, file->file_path, cls, member);
+    return *out_qn ? CBM_PSR4_MEMBER_RESOLVED : CBM_PSR4_MEMBER_UNRESOLVED;
 }
 
 const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t *ctx,
@@ -2154,7 +2233,7 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
     /* PHP class imports covered by a composer psr-4 prefix name exactly one
      * file; when it is absent the import stays unresolved (#1186). */
     const cbm_gbuf_node_t *psr4_target = NULL;
-    switch (resolve_php_psr4_class(ctx, source_file_qn, imp, &psr4_target)) {
+    switch (resolve_php_psr4_class(ctx->gbuf, source_file_qn, imp, &psr4_target)) {
     case PSR4_RESOLVED:
         return psr4_target;
     case PSR4_UNRESOLVED:

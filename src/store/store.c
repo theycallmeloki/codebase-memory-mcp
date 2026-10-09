@@ -431,23 +431,34 @@ static int init_schema(cbm_store_t *s) {
     "coalesce(json_extract(properties,'$.llm_summary'),'') || ' ' || "  \
     "coalesce(json_extract(properties,'$.llm_business_context'),'')), '') END"
 
+/* nodes_fts.qualified_name: the QN without the C-macro fence. A macro's QN is
+ * `<module>.NAME#macro` (CBM_MACRO_QN_SUFFIX in internal/cbm/cbm.h), and `#`
+ * separates tokens, so the fence would add the word "macro" to every macro
+ * node a second time (the label column already says Macro). On a C repository
+ * that is thousands of rows outscoring the few nodes that carry the word in
+ * their NAME, enough to push those out of the BM25 candidate window. */
+#define FTS_QN_EXPR                                                        \
+    "CASE WHEN label = 'Macro' AND substr(qualified_name, -6) = '#macro' " \
+    "THEN substr(qualified_name, 1, length(qualified_name) - 6) "          \
+    "ELSE qualified_name END"
+
 /* Room for the widest INSERT fts_backfill_try builds: the whole statement text,
- * not just the expression. The bound is stated as a compile-time check below so
- * a future FTS_BODY_EXPR cannot silently outgrow it.
+ * not just the expressions. The bound is stated as a compile-time check below
+ * so that neither expression can silently outgrow it.
  *
  * WHY THIS MATTERS MORE THAN A TRUNCATED STRING USUALLY WOULD: the wholesale
  * caller runs "delete-all" BEFORE the ladder, so a statement that fails to fit
  * (or to prepare) leaves nodes_fts EMPTY rather than leaving the previous
  * contents in place. Search does not degrade, it disappears — and the failure
- * is invisible unless someone indexes a term that should have matched. */
+ * is invisible unless someone indexes a term that should have matched.
+ *
+ * The statement carries BOTH expressions, so the assert bounds both. Measured
+ * when the prose keys were added: FTS_BODY_EXPR 388 + FTS_QN_EXPR 151 + the
+ * longest template form (body, camel wrapper, project clause) 177 = 716. */
 enum { FTS_SQL_BUF = 2048 };
 
-/* FTS_BODY_EXPR measured 387 bytes when the prose keys were added, against an
- * INSERT template of ~156 plus the optional project clause and camel wrapper.
- * 320 bytes of headroom keeps the assertion honest without pinning the exact
- * template, which is free to change. */
-_Static_assert(FTS_SQL_BUF >= (int)(sizeof(FTS_BODY_EXPR) + 320),
-               "FTS_SQL_BUF is too small for FTS_BODY_EXPR: raise it, or the "
+_Static_assert(FTS_SQL_BUF >= (int)(sizeof(FTS_BODY_EXPR) + sizeof(FTS_QN_EXPR) + 320),
+               "FTS_SQL_BUF is too small for the FTS backfill statement: raise it, or the "
                "wholesale FTS backfill truncates and empties the index");
 
 /* Does nodes_fts carry the `body` column?  A database created by an older
@@ -473,7 +484,7 @@ static int fts_backfill_try(cbm_store_t *s, const char *project, int64_t after_i
     char sql[FTS_SQL_BUF];
     int n = snprintf(sql, sizeof(sql),
                      "INSERT INTO nodes_fts (rowid, name, qualified_name, label, file_path%s)"
-                     " SELECT id, %s, qualified_name, label, file_path%s FROM nodes%s;",
+                     " SELECT id, %s, " FTS_QN_EXPR ", label, file_path%s FROM nodes%s;",
                      with_body ? ", body" : "", camel ? "cbm_camel_split(name)" : "name",
                      with_body ? ", " FTS_BODY_EXPR : "",
                      project ? " WHERE project = ?1 AND id > ?2" : "");
@@ -1013,33 +1024,24 @@ static bool build_immutable_uri(const char *path, char *out, size_t out_sz) {
     return true;
 }
 
-cbm_store_t *cbm_store_open_path_query(const char *db_path) {
-    if (!db_path) {
-        return NULL;
-    }
-
-    cbm_store_t *s = calloc(CBM_ALLOC_ONE, sizeof(cbm_store_t));
-    if (!s) {
-        return NULL;
-    }
-
-    /* Query tools open the project DB READ-ONLY: a read query must never
-     * mutate the DB (the previous READWRITE open + WAL write-pragmas did),
-     * and must work on a read-only DB file / filesystem.
-     *
-     * Try a plain READONLY open first — on a normal writable filesystem this
-     * reads WAL frames correctly via the -shm wal-index. SQLite opens lazily,
-     * so a read-only-filesystem failure (cannot create -shm for a WAL-mode
-     * DB) surfaces on first access, not at open time; we probe with a trivial
-     * read to force it. If the probe fails, retry once with an immutable URI
-     * that bypasses WAL and reads the main DB file directly.
-     *
-     * No SQLITE_OPEN_CREATE on either path — a missing DB must return NULL
-     * (no ghost .db for unknown/unindexed projects). */
+/* Query tools open the project DB READ-ONLY: a read query must never
+ * mutate the DB (the previous READWRITE open + WAL write-pragmas did),
+ * and must work on a read-only DB file / filesystem.
+ *
+ * Try a plain READONLY open first — on a normal writable filesystem this
+ * reads WAL frames correctly via the -shm wal-index. SQLite opens lazily,
+ * so a read-only-filesystem failure (cannot create -shm for a WAL-mode
+ * DB) surfaces on first access, not at open time; we probe with a trivial
+ * read to force it. If the probe fails, retry once with an immutable URI
+ * that bypasses WAL and reads the main DB file directly.
+ *
+ * No SQLITE_OPEN_CREATE on either path — a missing DB must return NULL
+ * (no ghost .db for unknown/unindexed projects). Returns false with s->db
+ * closed when the DB cannot be opened. */
+static bool query_open_first_access(cbm_store_t *s, const char *db_path) {
     char open_path[4096];
     if (!cbm_path_for_file_api(db_path, open_path, sizeof(open_path))) {
-        free(s);
-        return NULL;
+        return false;
     }
     int rc = sqlite3_open_v2(open_path, &s->db, SQLITE_OPEN_READONLY, NULL);
     if (rc == SQLITE_OK) {
@@ -1059,21 +1061,67 @@ cbm_store_t *cbm_store_open_path_query(const char *db_path) {
          * be opened (the read-only-filesystem case). This also keeps the
          * common "project not found" path to a single open attempt. */
         if (!cbm_file_exists(db_path)) {
-            free(s);
-            return NULL;
+            return false;
         }
         char uri[ST_QUERY_URI_MAX];
         if (!build_immutable_uri(db_path, uri, sizeof(uri))) {
-            free(s);
-            return NULL;
+            return false;
         }
         rc = sqlite3_open_v2(uri, &s->db, SQLITE_OPEN_READONLY | SQLITE_OPEN_URI, NULL);
         if (rc != SQLITE_OK) {
             /* sqlite3_open_v2 allocates a handle even on failure — must close it. */
             sqlite3_close(s->db);
-            free(s);
-            return NULL;
+            s->db = NULL;
+            return false;
         }
+    }
+    return true;
+}
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+static void (*g_first_access_hook)(void *ctx) = NULL;
+static void *g_first_access_hook_ctx = NULL;
+void cbm_store_query_first_access_hook_for_testing(void (*hook)(void *ctx), void *ctx) {
+    g_first_access_hook = hook;
+    g_first_access_hook_ctx = ctx;
+}
+static void query_first_access_hook(void) {
+    if (g_first_access_hook) {
+        g_first_access_hook(g_first_access_hook_ctx);
+    }
+}
+#else
+static void query_first_access_hook(void) {}
+#endif
+
+cbm_store_t *cbm_store_open_path_query(const char *db_path) {
+    if (!db_path) {
+        return NULL;
+    }
+
+    cbm_store_t *s = calloc(CBM_ALLOC_ONE, sizeof(cbm_store_t));
+    if (!s) {
+        return NULL;
+    }
+
+    /* One query connection at a time takes its first look at the WAL. On an
+     * idle DB (no connection open, -shm reset) that first read runs WAL
+     * recovery, rebuilding the shared wal-index header under SQLite's write
+     * lock, while another opener reads the same header lock-free before it
+     * takes its read lock (walTryBeginRead). Across processes SQLite's file
+     * locks order the two; between this process's request threads nothing
+     * did, and TSan reported walTryBeginRead against walIndexRecover from
+     * concurrent index_repository requests. Holding one process-wide mutex
+     * across open + first access puts a recovery before the next connection's
+     * first read. The probe is one sqlite_master read, so the hold is short. */
+    sqlite3_mutex *first_access = sqlite3_mutex_alloc(SQLITE_MUTEX_STATIC_APP1);
+    sqlite3_mutex_enter(first_access);
+    bool opened = query_open_first_access(s, db_path);
+    query_first_access_hook();
+    sqlite3_mutex_leave(first_access);
+    if (!opened) {
+        free(s);
+        return NULL;
     }
 
     s->db_path = heap_strdup(db_path);
@@ -2742,6 +2790,77 @@ int cbm_store_generation(cbm_store_t *s, char *buf, size_t bufsz) {
         buf[0] = '\0';
         store_set_error(s, "store generation output buffer is too small");
         return CBM_STORE_ERR;
+    }
+    return CBM_STORE_OK;
+}
+
+int cbm_store_meta_get(cbm_store_t *s, const char *key, char **out) {
+    if (!out) {
+        return CBM_STORE_ERR;
+    }
+    *out = NULL;
+    if (!s || !s->db || !key) {
+        return CBM_STORE_ERR;
+    }
+    sqlite3_stmt *get = NULL;
+    /* A store that never advanced its generation has no store_meta table:
+     * that is "no value recorded", not an error. */
+    if (sqlite3_prepare_v2(s->db, "SELECT v FROM store_meta WHERE k = ?1;", CBM_NOT_FOUND, &get,
+                           NULL) != SQLITE_OK) {
+        sqlite3_finalize(get);
+        return CBM_STORE_NOT_FOUND;
+    }
+    bind_text(get, SKIP_ONE, key);
+    int rc = sqlite3_step(get);
+    if (rc == SQLITE_ROW) {
+        const char *value = (const char *)sqlite3_column_text(get, 0);
+        *out = cbm_mem_strdup(CBM_MEM_CLASS_STORE, value ? value : "");
+        sqlite3_finalize(get);
+        return *out ? CBM_STORE_OK : CBM_STORE_ERR;
+    }
+    sqlite3_finalize(get);
+    return rc == SQLITE_DONE ? CBM_STORE_NOT_FOUND : CBM_STORE_ERR;
+}
+
+int cbm_store_meta_put(cbm_store_t *s, const char *key, const char *value) {
+    static const char savepoint[] = "SAVEPOINT cbm_meta_put;";
+    static const char rollback[] = "ROLLBACK TO cbm_meta_put;";
+    static const char release[] = "RELEASE cbm_meta_put;";
+    if (!s || !s->db || !key || !value) {
+        return CBM_STORE_ERR;
+    }
+    if (exec_sql(s, savepoint) != CBM_STORE_OK) {
+        return CBM_STORE_ERR;
+    }
+    /* store_meta is only ever created by the generation seed, which writes
+     * db_uid + mutation_gen with it. Creating the table here without them
+     * would make cbm_store_generation() report malformed metadata, so an
+     * absent table is seeded through that one path. */
+    bool absent = false;
+    char uid[17] = {0};
+    char counter[21] = {0};
+    uint64_t counter_value = 0;
+    if (generation_metadata_read(s, &absent, uid, counter, &counter_value) != CBM_STORE_OK ||
+        (absent && cbm_store_generation_advance(s) != CBM_STORE_OK)) {
+        return rollback_savepoint_preserving_error(s, rollback, release);
+    }
+    sqlite3_stmt *set = NULL;
+    if (sqlite3_prepare_v2(s->db, "INSERT OR REPLACE INTO store_meta (k, v) VALUES (?1, ?2);",
+                           CBM_NOT_FOUND, &set, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "store_meta put prepare");
+        sqlite3_finalize(set);
+        return rollback_savepoint_preserving_error(s, rollback, release);
+    }
+    bind_text(set, SKIP_ONE, key);
+    bind_text(set, ST_COL_2, value);
+    int rc = sqlite3_step(set);
+    sqlite3_finalize(set);
+    if (rc != SQLITE_DONE) {
+        store_set_error_sqlite(s, "store_meta put");
+        return rollback_savepoint_preserving_error(s, rollback, release);
+    }
+    if (exec_sql(s, release) != CBM_STORE_OK) {
+        return rollback_savepoint_preserving_error(s, rollback, release);
     }
     return CBM_STORE_OK;
 }

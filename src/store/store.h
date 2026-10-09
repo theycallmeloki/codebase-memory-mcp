@@ -385,6 +385,13 @@ cbm_store_t *cbm_store_open_path_existing(const char *db_path);
  * exist — never creates a new .db file. */
 cbm_store_t *cbm_store_open_path_query(const char *db_path);
 
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* Every following query open calls `hook(ctx)` inside its first-access
+ * section (after the first read, the process-wide lock still held) until the
+ * hook is cleared with NULL. Test builds only. */
+void cbm_store_query_first_access_hook_for_testing(void (*hook)(void *ctx), void *ctx);
+#endif
+
 /* Validate and seal an existing DB for atomic replacement without creating or
  * migrating its schema. Returns OK when sealed, NOT_FOUND when the bytes are
  * definitely corrupt/incompatible and should be quarantined, or ERR when the
@@ -522,6 +529,17 @@ int cbm_store_generation_advance(cbm_store_t *s);
  * only when store_meta is genuinely absent; malformed or missing metadata is
  * an error. */
 int cbm_store_generation(cbm_store_t *s, char *buf, size_t bufsz);
+
+/* Per-store feature metadata in store_meta (key/value text). Keys are
+ * namespaced by the owning feature, e.g. "cross_repo_last_run:<project>".
+ * get: CBM_STORE_OK with *out owned by the caller (release with
+ * cbm_free(CBM_MEM_CLASS_STORE, *out)), or
+ * CBM_STORE_NOT_FOUND when the key -- or store_meta itself -- is absent.
+ * Read-only: safe on a store opened for query.
+ * put: upserts the key; seeds store_meta through the generation path when a
+ * legacy store lacks it. Atomic (savepoint); needs a read-write store. */
+int cbm_store_meta_get(cbm_store_t *s, const char *key, char **out);
+int cbm_store_meta_put(cbm_store_t *s, const char *key, const char *value);
 
 /* Seal a fully-written staging database before atomic publication.
  * Raises synchronous to FULL, requires an exclusive TRUNCATE checkpoint to
