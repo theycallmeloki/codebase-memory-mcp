@@ -593,7 +593,17 @@ static char *enrich_merge_props(const char *old,
 /* Does this node already carry prose? Used only to skip work when a buffer was
  * rebuilt for a file whose content did not change. A raw substring probe is
  * deliberate: properties are machine-written JSON, and a full parse per node
- * would cost more than the check saves. */
+ * would cost more than the check saves.
+ *
+ * Placeholder prose needs no special case here. It would only matter if a
+ * route ran the pass over a node whose properties still held a stub, and no
+ * route does: every route that runs the pass recreates the File node first
+ * (the closure route writes {"extension":...} and the merge replaces the row),
+ * so the stub is gone before the check is reached. Verified against the
+ * released binary: stubbing a repo and then re-indexing with the model
+ * configured (one file changed, one added) replaced every placeholder with
+ * real prose. Making placeholders "not done" would guard a case that cannot
+ * occur. */
 static bool enrich_already_done(const cbm_gbuf_node_t *node) {
     const char *props = node ? node->properties_json : NULL;
     return props && strstr(props, ENRICH_KEYS[ENRICH_KEY_PURPOSE]) != NULL;
@@ -714,7 +724,21 @@ int cbm_pipeline_pass_llm_enrich(cbm_pipeline_ctx_t *ctx) {
     (void)snprintf(n_skipped, sizeof(n_skipped), "%d", skipped);
     cbm_log_info("llm_enrich.done", "model", cfg.on ? cfg.model : "(stub)", "enriched", n_enriched,
                  "skipped", n_skipped);
-    if (failed > 0) {
+    if (!cfg.on && enriched > 0) {
+        /* Placeholder prose is a misconfiguration, not a result. It looks like
+         * a working index until someone reads it, and the placeholder text
+         * itself ("stub", "purpose", "source file") pollutes the BM25 body of
+         * every file it touches. Stub mode is only ever right for a deliberate
+         * offline run, so it must not pass silently. */
+        char detail[CBM_SZ_256];
+        (void)snprintf(detail, sizeof(detail),
+                       "%s file(s) got PLACEHOLDER prose: CBM_LLM_URL is unset, so no model was "
+                       "called and the index now carries placeholder text instead of "
+                       "descriptions. Set CBM_LLM_URL in the environment that starts the "
+                       "daemon, then re-index.",
+                       n_enriched);
+        cbm_pipeline_set_llm_notice(ctx->pipeline, "stub", detail);
+    } else if (failed > 0) {
         char n_failed[CBM_SZ_16];
         char n_attempted[CBM_SZ_16];
         char detail[CBM_SZ_256];
