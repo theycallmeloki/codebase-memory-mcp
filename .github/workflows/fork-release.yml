@@ -230,17 +230,24 @@ jobs:
           # with "fatal: not a git repository" -- which is exactly how the first
           # tag push failed.
           #
-          # Only the real artifacts are attached; dist/ also collects the
-          # per-platform directories from the build legs, and `dist/*` once
-          # shipped those too.
+          # THE ASSET LIST IS BUILT, NOT GLOBBED. gh resolves its own globs and
+          # ERRORS on a pattern that matches nothing ("no matches found for
+          # `dist/*.zip`"), so a Linux-only release died on the windows pattern.
+          # Collect what actually exists instead; this also keeps the per-
+          # platform directories the build legs upload out of the release.
+          assets=()
+          for f in dist/*.tar.gz dist/*.zip dist/*.mcpb dist/checksums.txt; do
+            [ -f "$f" ] && assets+=("$f")
+          done
+          [ "${#assets[@]}" -gt 0 ] || { echo "::error::no release assets found"; exit 1; }
+          printf 'publishing: %s\n' "${assets[@]}"
+
           if gh release view "$VERSION" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release upload "$VERSION" dist/*.tar.gz dist/*.zip dist/*.mcpb \
-              dist/checksums.txt -R "$GITHUB_REPOSITORY" --clobber
+            gh release upload "$VERSION" "${assets[@]}" -R "$GITHUB_REPOSITORY" --clobber
           else
             # --generate-notes, not an empty --notes: a tag push has no workflow
             # input, so the old input-derived string was empty and produced a
             # release with a blank body.
-            gh release create "$VERSION" dist/*.tar.gz dist/*.zip dist/*.mcpb \
-              dist/checksums.txt -R "$GITHUB_REPOSITORY" \
+            gh release create "$VERSION" "${assets[@]}" -R "$GITHUB_REPOSITORY" \
               --title "$VERSION" --generate-notes
           fi
