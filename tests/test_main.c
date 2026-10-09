@@ -368,10 +368,27 @@ static void tf_index_worker_probe(const char *args_json, const char *response_ou
     if (!args_json || !strstr(args_json, "\"__cbm_test_worker\"")) {
         return;
     }
+    if (strstr(args_json, "\"clean-unpublished\"")) {
+        /* A clean exit that did NOT publish (aborted_previous_preserved, #2020).
+         * The supervisor keeps the log for this outcome: it is the only record
+         * of why the previous index is still the one serving. */
+        FILE *response = response_out ? cbm_fopen(response_out, "wb") : NULL;
+        if (response) {
+            (void)fputs("{\"status\":\"aborted_previous_preserved\"}", response);
+            (void)fclose(response);
+        }
+        (void)fprintf(stderr, "async worker clean-unpublished probe\n");
+        fflush(NULL);
+        _Exit(response ? 0 : 1);
+    }
     if (strstr(args_json, "\"clean\"")) {
         FILE *response = response_out ? cbm_fopen(response_out, "wb") : NULL;
         if (response) {
-            (void)fputs("{\"probe\":\"clean\"}", response);
+            /* A PUBLISHED result, which is what the supervisor keys the log's
+             * lifetime on. The old fixture wrote {"probe":"clean"}, a shape no
+             * real run produces, so it silently stopped modelling the case it
+             * was asserting ("a run that published deletes its scratch log"). */
+            (void)fputs("{\"status\":\"indexed\"}", response);
             (void)fclose(response);
         }
         (void)fprintf(stderr, "async worker clean probe\n");

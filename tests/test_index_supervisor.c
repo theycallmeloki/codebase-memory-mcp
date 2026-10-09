@@ -638,6 +638,13 @@ TEST(index_supervisor_terminal_log_lifecycle_matches_outcome_and_profiling) {
         "clean", true, &profile_outcome, &profile_response, &profile_log, &profile_response_file);
     bool crash_terminal = index_supervisor_test_run_probe(
         "crash", false, &crash_outcome, &crash_response, &crash_log, &crash_response_file);
+    cbm_proc_outcome_t unpublished_outcome = CBM_PROC_SPAWN_FAILED;
+    bool unpublished_response = false;
+    bool unpublished_log = false;
+    bool unpublished_response_file = true;
+    bool unpublished_terminal = index_supervisor_test_run_probe(
+        "clean-unpublished", false, &unpublished_outcome, &unpublished_response, &unpublished_log,
+        &unpublished_response_file);
 #ifdef _WIN32
     bool crash_classified_failure = crash_outcome != CBM_PROC_CLEAN;
 #else
@@ -666,6 +673,14 @@ TEST(index_supervisor_terminal_log_lifecycle_matches_outcome_and_profiling) {
     ASSERT_FALSE(crash_response);
     ASSERT_TRUE(crash_log);
     ASSERT_FALSE(crash_response_file);
+    /* CLEAN is not the same as SUCCESS. An abort exits zero, so the log has to
+     * survive a run that did not publish -- it is the only record of why the
+     * previous index is still the one serving. */
+    ASSERT_TRUE(unpublished_terminal);
+    ASSERT_EQ(unpublished_outcome, CBM_PROC_CLEAN);
+    ASSERT_TRUE(unpublished_response);
+    ASSERT_TRUE(unpublished_log);
+    ASSERT_FALSE(unpublished_response_file);
 #ifdef _WIN32
     ASSERT_EQ(g_index_supervisor_memory_log_count, 1); /* crash only, never clean */
     ASSERT_TRUE(strstr(g_index_supervisor_memory_log, "job_limit_bytes=1610612736") != NULL);
@@ -689,8 +704,8 @@ TEST(index_supervisor_worker_keeps_default_info_liveness_heartbeat) {
     (void)cbm_unsetenv("CBM_LOG_LEVEL");
 
     cbm_index_worker_handle_t *handle = NULL;
-    int start_rc = cbm_index_worker_start("{\"__cbm_test_worker\":\"heartbeat\"}", 0, false,
-                                          NULL, NULL, &handle);
+    int start_rc = cbm_index_worker_start("{\"__cbm_test_worker\":\"heartbeat\"}", 0, false, NULL,
+                                          NULL, &handle);
     char log_path[INDEX_SUPERVISOR_TEST_PATH_CAP] = {0};
     if (handle) {
         (void)snprintf(log_path, sizeof(log_path), "%s", cbm_index_worker_log_path(handle));
@@ -698,8 +713,8 @@ TEST(index_supervisor_worker_keeps_default_info_liveness_heartbeat) {
     bool ready = log_path[0] && index_supervisor_test_wait_file_text(
                                     log_path, "async worker heartbeat probe ready",
                                     INDEX_SUPERVISOR_TEST_READY_MS);
-    bool heartbeat = ready && index_supervisor_test_wait_file_text(
-                                  log_path, "msg=pipeline.discover", 1000);
+    bool heartbeat =
+        ready && index_supervisor_test_wait_file_text(log_path, "msg=pipeline.discover", 1000);
     const cbm_index_worker_result_t *result = NULL;
     bool terminal = handle && index_supervisor_test_poll_terminal(
                                   handle, INDEX_SUPERVISOR_TEST_TERMINAL_MS, &result);
