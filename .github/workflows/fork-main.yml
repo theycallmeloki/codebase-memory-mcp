@@ -1,0 +1,87 @@
+# Fork main gate — keep main always taggable.
+#
+# This is NOT a pull-request gate: this fork pushes straight to main on purpose,
+# so the branch is protected by knowing about breakage immediately rather than by
+# blocking the push. The build job is the part that matters: fork-release.yml
+# publishes whatever a tag points at, and a tag on a commit that does not build
+# (or whose binary segfaults on --version) is the one failure worth catching
+# before it becomes a release.
+#
+# Upstream's reusable _build.yml/_lint.yml are not used here: they are wired into
+# their release graph and expect their own secrets. The commands below are the
+# same ones they run, just without the parts a fork cannot authenticate.
+#
+# THE ALLOCATOR OVERRIDE IS CLEARED, as in fork-release.yml: on a 2026
+# gcc/glibc toolchain the production build segfaults before main() with
+# -DMI_MALLOC_OVERRIDE=1 (mimalloc serves libc malloc process-wide, and
+# libstdc++'s static locale initialiser allocates through newlocale before
+# mimalloc's runtime is up). macOS already disables this override upstream. The
+# smoke step is what makes that failure loud instead of a shipped binary that
+# cannot print its own version.
+
+name: Fork Main
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build + smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # zlib is the one non-toolchain dependency scripts/build.sh needs.
+      - name: Install deps
+        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev
+
+      - name: Build
+        env:
+          VERSION: main-${{ github.sha }}
+        run: |
+          set -eux
+          scripts/build.sh --version "$VERSION" \
+            GLOBAL_OVERRIDE_DEFINE= MIMALLOC_OVERRIDE_DEFINE=
+
+      - name: Smoke test
+        run: |
+          set -eux
+          BIN=build/c/codebase-memory-mcp
+          test -x "$BIN"
+          "$BIN" --version
+          "$BIN" --help > /dev/null
+
+  lint:
+    name: lint (advisory)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    # ADVISORY, deliberately. Formatting is worth knowing about but must not
+    # make main look broken, because every merged upstream commit is a fresh
+    # chance for their formatter to disagree with a pinned one. `continue-on-
+    # error` reports the failure without failing the run.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install deps
+        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev cppcheck
+
+      # The project formatter is LLVM 20; the distro's clang-format is a
+      # different major and would produce whole-file false drift.
+      - name: Install clang-format-20
+        run: |
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key \
+            | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc
+          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-20 main" \
+            | sudo tee /etc/apt/sources.list.d/llvm-20.list
+          sudo apt-get update
+          sudo apt-get install -y clang-format-20
+
+      - name: Lint (cppcheck + clang-format, as upstream's gate runs it)
+        run: scripts/lint.sh --ci CLANG_FORMAT=clang-format-20
