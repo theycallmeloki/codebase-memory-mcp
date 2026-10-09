@@ -163,11 +163,21 @@ jobs:
         run: |
           set -eux
           ls -la dist
-          # Notes are prose, so they come from the workflow input when given;
-          # a tag push has no input and gets the generated notes instead.
-          NOTES="${{ inputs.version != '' && 'Release built from the fork workflow.' || '' }}"
-          if gh release view "$VERSION" >/dev/null 2>&1; then
-            gh release upload "$VERSION" dist/* --clobber
+          # -R is REQUIRED here, not decorative: this job only downloads
+          # artifacts and never checks the repository out, so there is no .git
+          # for gh to infer the repository from. It shells out to git and dies
+          # with "fatal: not a git repository" -- which is exactly how the first
+          # tag push failed.
+          #
+          # Only the tarballs and their checksums are published. dist/ also
+          # holds the unpacked directories, and `dist/*` shipped those too.
+          if gh release view "$VERSION" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$VERSION" dist/*.tar.gz dist/*.sha256 \
+              -R "$GITHUB_REPOSITORY" --clobber
           else
-            gh release create "$VERSION" dist/* --title "$VERSION" --notes "$NOTES"
+            # --generate-notes, not an empty --notes: a tag push has no workflow
+            # input, so the old input-derived string was empty and produced a
+            # release with a blank body.
+            gh release create "$VERSION" dist/*.tar.gz dist/*.sha256 \
+              -R "$GITHUB_REPOSITORY" --title "$VERSION" --generate-notes
           fi
