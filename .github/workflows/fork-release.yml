@@ -1,0 +1,173 @@
+# Fork release — build the binary in this fork and publish it as a GitHub Release,
+# so the tool can be installed from a release URL instead of built locally.
+#
+# WHY THIS EXISTS, given .github/workflows/release.yml already ships:
+# that pipeline is upstream's, and it is not usable from a fork. It runs the
+# full gate (lint, test, smoke, soak, CodeQL, VirusTotal-scan of every
+# candidate, code-scanning alert counts), it requires a VirusTotal API key, and
+# it publishes to npm and PyPI — registries a fork holds no credentials for and
+# no permission to write. Anything closer to it than this file is a pipeline
+# that fails on the first step that needs a secret.
+#
+# This workflow keeps the parts that matter here — the canonical build script,
+# the same compiler matrix, a real smoke test — and publishes only the GitHub
+# Release. Upstream's release.yml is left untouched so the fork can still merge
+# from it.
+#
+# THE ALLOCATOR OVERRIDE IS CLEARED BY DEFAULT. On a 2026 gcc/glibc toolchain
+# the production build segfaults before main(): the Makefile forces
+# -DMI_MALLOC_OVERRIDE=1, so mimalloc serves libc malloc process-wide, and
+# libstdc++'s static locale initialiser allocates through newlocale before
+# mimalloc's runtime is up — mi_free on an uninitialised heap. The Makefile
+# already disables this override permanently on macOS for the same reason. Set
+# the `allocator_override` input to true to build upstream's way instead; the
+# smoke test below fails the job rather than publishing a binary that cannot
+# print its own version.
+
+name: Fork Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to tag and release (e.g. v0.1.0-local)"
+        required: true
+        type: string
+      allocator_override:
+        description: "Build with upstream's mimalloc global override (may segfault on new toolchains)"
+        required: false
+        type: boolean
+        default: false
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build ${{ matrix.goos }}-${{ matrix.goarch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            goos: linux
+            goarch: amd64
+            cc: gcc
+            cxx: g++
+          - runner: ubuntu-24.04-arm
+            goos: linux
+            goarch: arm64
+            cc: gcc
+            cxx: g++
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # zlib is the one non-toolchain dependency scripts/build.sh needs.
+      - name: Install deps
+        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev
+
+      - name: Resolve version
+        id: ver
+        env:
+          IN_VERSION: ${{ inputs.version }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          V="${IN_VERSION:-$REF_NAME}"
+          case "$V" in
+            v*) ;;
+            *) echo "::error::version must start with 'v' (got '$V')"; exit 1 ;;
+          esac
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+
+      # Upstream's own build entry point — the single source of truth for
+      # release binaries, used identically by their CI. Clearing the two
+      # override defines is the only deviation, and only by default.
+      - name: Build
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+          CC: ${{ matrix.cc }}
+          CXX: ${{ matrix.cxx }}
+          OVERRIDE: ${{ inputs.allocator_override }}
+        run: |
+          set -eux
+          if [ "$OVERRIDE" = "true" ]; then
+            scripts/build.sh --version "$VERSION" "CC=$CC" "CXX=$CXX"
+          else
+            scripts/build.sh --version "$VERSION" "CC=$CC" "CXX=$CXX" \
+              GLOBAL_OVERRIDE_DEFINE= MIMALLOC_OVERRIDE_DEFINE=
+          fi
+
+      # FAIL LOUDLY RATHER THAN SHIP A BINARY THAT CRASHES ON STARTUP.
+      # A --version that segfaults is the exact failure the override flag
+      # above exists to avoid, and it is cheap to detect here.
+      - name: Smoke test
+        run: |
+          set -eux
+          BIN=build/c/codebase-memory-mcp
+          test -x "$BIN"
+          "$BIN" --version | tee /tmp/version.txt
+          grep -q . /tmp/version.txt
+          "$BIN" --help > /dev/null
+
+      - name: Package
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -eux
+          NAME="codebase-memory-mcp-${VERSION}-${GOOS}-${GOARCH}"
+          mkdir -p "dist/$NAME"
+          cp build/c/codebase-memory-mcp "dist/$NAME/"
+          cp LICENSE THIRD_PARTY.md "dist/$NAME/" 2>/dev/null || true
+          tar -C dist -czf "dist/$NAME.tar.gz" "$NAME"
+          ( cd dist && sha256sum "$NAME.tar.gz" > "$NAME.tar.gz.sha256" )
+          ls -la dist
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dist-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Resolve version
+        id: ver
+        env:
+          IN_VERSION: ${{ inputs.version }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          V="${IN_VERSION:-$REF_NAME}"
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -eux
+          ls -la dist
+          # Notes are prose, so they come from the workflow input when given;
+          # a tag push has no input and gets the generated notes instead.
+          NOTES="${{ inputs.version != '' && 'Release built from the fork workflow.' || '' }}"
+          if gh release view "$VERSION" >/dev/null 2>&1; then
+            gh release upload "$VERSION" dist/* --clobber
+          else
+            gh release create "$VERSION" dist/* --title "$VERSION" --notes "$NOTES"
+          fi
