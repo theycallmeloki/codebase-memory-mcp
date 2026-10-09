@@ -3926,8 +3926,19 @@ enum {
  * Safe against a legacy four-column nodes_fts: FTS5's bm25() reads a weight
  * only when an instance actually lands in that column (`nVal > ic`), so the
  * fifth weight is simply never consulted on a table that has no fifth
- * column. */
-#define BM25_WEIGHTS "bm25(nodes_fts, 1.0, 1.0, 1.0, 1.0, 0.3)"
+ * column.
+ *
+ * The body weight was 0.3 when body held only doc comments — a weak signal it
+ * was right to distrust. pass_llm_enrich changed what body IS: for a File node
+ * it is now the only place the file's purpose and behaviour are written down,
+ * so a natural-language question whose answer is a File has to be able to
+ * out-rank symbols that merely share a query word. At 0.3 it could not — File
+ * nodes were absent from the top 5 of every natural-language query tried; at
+ * 1.0 they land rank 1-2. Three symbol queries (mirror_for_job, stamp_marker,
+ * jenkins_codemod) returned the same top file before and after, so the raise
+ * cost the exact-name path nothing. Measured on sandman-pipelines, 58 files.
+ * The pair 0.3 -> 1.0 was measured; intermediate values were not. */
+#define BM25_WEIGHTS "bm25(nodes_fts, 1.0, 1.0, 1.0, 1.0, 1.0)"
 
 /* Module-local SQLITE_TRANSIENT wrapper to dodge performance-no-int-to-ptr.
  * See the matching helper in src/store/store.c for the same pattern. */
@@ -4213,9 +4224,14 @@ static char *bm25_search(cbm_store_t *store, const char *project, const char *qu
         /* Section and Module are NO LONGER excluded (#518/#519): they are the
          * labels that carry prose — a Markdown section's body, a config file's
          * description — so excluding them made the body column unreachable.
+         * File joins them for the same reason: pass_llm_enrich writes per-file
+         * purpose/summary/business context into the File node's properties, and
+         * FTS_BODY_EXPR indexes it, so excluding File would index prose that no
+         * query can ever return. Excluding a label is only harmless while that
+         * label has no body to match.
          * This exclusion list is MIRRORED in the count query below; the two
          * must be changed together or results desynchronise from counts. */
-        "  AND n.label NOT IN ('File','Folder','Variable','Project') "
+        "  AND n.label NOT IN ('Folder','Variable','Project') "
         "  AND (?6 IS NULL OR n.file_path LIKE ?6) "
         /* The caller's label filter applies in query mode exactly as it does
          * in the structural mode (2026-09-16 probe: `label=Class` was ignored
@@ -4262,7 +4278,7 @@ static char *bm25_search(cbm_store_t *store, const char *project, const char *qu
                                 /* MIRRORS the ranked query's filter verbatim — same weights, same
                                  * label exclusions. Changing one alone reports a total that does
                                  * not describe the rows returned. */
-                                "      AND n.label NOT IN ('File','Folder','Variable','Project')"
+                                "      AND n.label NOT IN ('Folder','Variable','Project')"
                                 "      AND (?6 IS NULL OR n.file_path LIKE ?6)"
                                 "      AND (?7 IS NULL OR n.label = ?7)"
                                 ")";

@@ -1731,6 +1731,9 @@ static void predump_ensemble(cbm_pipeline_ctx_t *ctx) {
 static void predump_importance(cbm_pipeline_ctx_t *ctx) {
     cbm_pipeline_pass_importance(ctx);
 }
+static void predump_llm_enrich(cbm_pipeline_ctx_t *ctx) {
+    cbm_pipeline_pass_llm_enrich(ctx);
+}
 
 /* Phase boundary for memory attribution. Two instruments, both already in
  * foundation/, both previously wired ONLY into MCP request handling and never
@@ -1968,6 +1971,11 @@ static void run_predump_passes(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx) {
          * (pass_tests, which run_post_extraction runs before this loop), so
          * every edge type its score depends on already exists here. */
         {predump_importance, "importance", false},
+        /* Last, and the only entry whose cost is a network round-trip per
+         * changed file: everything it needs is the File node itself, so
+         * nothing downstream reads it. moderate_only, so FAST — which omits
+         * semantics by contract — does not pay for it. */
+        {predump_llm_enrich, "llm_enrich", true},
     };
     /* Derived from the table, never hand-written. A hand-written count that
      * lags a newly appended entry silently skips the LAST pass while every

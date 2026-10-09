@@ -411,21 +411,44 @@ static int init_schema(cbm_store_t *s) {
 
 /* ── FTS backfill ───────────────────────────────────────────────── */
 
-/* Prose source for nodes_fts.body: the docstring each node already carries in
- * its properties JSON.  Deriving it costs no new column on `nodes` and no new
- * table, which is exactly why CBM_INDEX_FORMAT_VERSION does not move and no
- * user is forced to reindex.
- *   - the LIKE prefilter keeps the JSON parse off the large majority of nodes
- *     that have no docstring at all;
- *   - json_valid() guards the parse because json_extract() RAISES on malformed
- *     properties, and pre-fix databases contain such rows (see the reverted
- *     is_entry_point expression index in create_user_indexes) — unguarded, one
- *     bad row would abort the entire backfill. */
-#define FTS_BODY_EXPR                                                         \
-    "CASE WHEN properties LIKE '%\"docstring\"%' AND json_valid(properties) " \
-    "THEN json_extract(properties, '$.docstring') END"
+/* Prose source for nodes_fts.body. Two families, both already resident in the
+ * node's properties JSON, so neither costs a column or a table:
+ *   - "docstring"  the language's own doc comment (pass_definitions).
+ *   - "llm_*"      model-written purpose / summary / business context
+ *                  (pass_llm_enrich) — what lets a natural-language question
+ *                  find a file whose identifiers share none of its vocabulary.
+ * The LIKE prefilter keeps the JSON parse off the large majority of nodes that
+ * carry neither family; json_valid() guards the parse because json_extract()
+ * RAISES on malformed properties, and pre-fix databases contain such rows (see
+ * the reverted is_entry_point expression index in create_user_indexes) —
+ * unguarded, one bad row would abort the entire backfill. NULLIF keeps the
+ * pre-existing "no prose ⇒ NULL body" contract rather than indexing ''. */
+#define FTS_BODY_EXPR                                                   \
+    "CASE WHEN (properties LIKE '%\"docstring\"%' OR properties LIKE "  \
+    "'%\"llm_summary\"%') AND json_valid(properties) THEN NULLIF(trim(" \
+    "coalesce(json_extract(properties,'$.docstring'),'') || ' ' || "    \
+    "coalesce(json_extract(properties,'$.llm_purpose'),'') || ' ' || "  \
+    "coalesce(json_extract(properties,'$.llm_summary'),'') || ' ' || "  \
+    "coalesce(json_extract(properties,'$.llm_business_context'),'')), '') END"
 
-enum { FTS_SQL_BUF = 512 };
+/* Room for the widest INSERT fts_backfill_try builds: the whole statement text,
+ * not just the expression. The bound is stated as a compile-time check below so
+ * a future FTS_BODY_EXPR cannot silently outgrow it.
+ *
+ * WHY THIS MATTERS MORE THAN A TRUNCATED STRING USUALLY WOULD: the wholesale
+ * caller runs "delete-all" BEFORE the ladder, so a statement that fails to fit
+ * (or to prepare) leaves nodes_fts EMPTY rather than leaving the previous
+ * contents in place. Search does not degrade, it disappears — and the failure
+ * is invisible unless someone indexes a term that should have matched. */
+enum { FTS_SQL_BUF = 2048 };
+
+/* FTS_BODY_EXPR measured 387 bytes when the prose keys were added, against an
+ * INSERT template of ~156 plus the optional project clause and camel wrapper.
+ * 320 bytes of headroom keeps the assertion honest without pinning the exact
+ * template, which is free to change. */
+_Static_assert(FTS_SQL_BUF >= (int)(sizeof(FTS_BODY_EXPR) + 320),
+               "FTS_SQL_BUF is too small for FTS_BODY_EXPR: raise it, or the "
+               "wholesale FTS backfill truncates and empties the index");
 
 /* Does nodes_fts carry the `body` column?  A database created by an older
  * build has only the four identifier columns, and CREATE VIRTUAL TABLE IF NOT

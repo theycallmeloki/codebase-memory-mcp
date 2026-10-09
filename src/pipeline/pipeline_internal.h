@@ -1070,6 +1070,12 @@ int cbm_pipeline_pass_configlink(cbm_pipeline_ctx_t *ctx);
 /* Pre-dump pass: markdown → file REFERENCES_FILE linking. */
 int cbm_pipeline_pass_doclinks(cbm_pipeline_ctx_t *ctx);
 
+/* Pre-dump pass: per-file natural-language enrichment (purpose / summary /
+ * business context), written into the File node's EXISTING properties_json blob
+ * so no column, table or index-format change is needed. The prose reaches BM25
+ * through nodes_fts.body, which store.c already derives from properties. */
+int cbm_pipeline_pass_llm_enrich(cbm_pipeline_ctx_t *ctx);
+
 /* Pre-dump pass: SIMILAR_TO edges via MinHash fingerprinting. */
 int cbm_pipeline_pass_similarity(cbm_pipeline_ctx_t *ctx);
 

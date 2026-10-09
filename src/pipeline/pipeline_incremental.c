@@ -1826,6 +1826,38 @@ static int run_postpasses(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed_file
         cbm_log_info("pass.timing", "pass", "incr_importance", "elapsed_ms",
                      itoa_buf((int)elapsed_ms(t)));
     }
+
+    /* Per-file prose.
+     *
+     * Runs on BOTH incremental routes, deliberately. It used to be gated on
+     * score_importance (the "buffer is the whole project" flag) on the theory
+     * that the closure route's proxy nodes have no file content to send. That
+     * was wrong twice over:
+     *
+     *   1. The pass does not read content from the buffer — it reads the file
+     *      from disk at repo_path/rel_path, so a proxy is as usable as a real
+     *      node.
+     *   2. Gating it off did not merely leave changed files un-enriched. The
+     *      closure route recreates each changed File node with properties of
+     *      {"extension":...} and the merge REPLACES the row, so the prose the
+     *      previous index wrote was DESTROYED — measured: editing one file and
+     *      re-indexing took the enriched-file count from 58 to 57. Since
+     *      edit-then-reindex is the everyday loop, the semantic layer would
+     *      have eroded with every edit.
+     *
+     * Running here is cheap because the two guards already in place do the
+     * work: enrich_already_done skips any node that kept its keys, and the
+     * content-addressed cache returns prose for an unchanged consumer without
+     * a model call. Only genuinely new content pays.
+     *
+     * The mode gate matches this pass's predump_path entry (moderate_only):
+     * FAST omits semantics by contract. */
+    if (ctx->mode <= CBM_MODE_MODERATE) {
+        cbm_clock_gettime(CLOCK_MONOTONIC, &t);
+        (void)cbm_pipeline_pass_llm_enrich(ctx);
+        cbm_log_info("pass.timing", "pass", "incr_llm_enrich", "elapsed_ms",
+                     itoa_buf((int)elapsed_ms(t)));
+    }
     if (cbm_pipeline_check_cancel(ctx)) {
         return CBM_NOT_FOUND;
     }
