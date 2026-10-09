@@ -4,11 +4,12 @@ set -euo pipefail
 # install.sh — One-line installer for codebase-memory-mcp.
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/theycallmeloki/codebase-memory-mcp/main/install.sh | bash
 #   curl -fsSL ... | bash -s -- --dir /path   # Custom install directory
 #
 # Environment:
 #   CBM_DOWNLOAD_URL  Override base URL for downloads (for testing)
+#   CBM_REPO          Override the source repository (default: this fork)
 
 # Wrap in main() to prevent partial execution from piped downloads.
 # If curl|bash is interrupted mid-transfer, bash would execute the partial
@@ -16,7 +17,7 @@ set -euo pipefail
 # called because the final line hasn't arrived yet.
 main() {
 
-REPO="DeusData/codebase-memory-mcp"
+REPO="${CBM_REPO:-theycallmeloki/codebase-memory-mcp}"
 INSTALL_DIR="$HOME/.local/bin"
 SKIP_CONFIG=false
 CLIENTS_SET=false

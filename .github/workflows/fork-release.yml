@@ -1,4 +1,4 @@
-# Fork release — build the binary in this fork and publish it as a GitHub Release,
+# Fork release — build this fork's binaries and publish them as a GitHub Release,
 # so the tool can be installed from a release URL instead of built locally.
 #
 # WHY THIS EXISTS, given .github/workflows/release.yml already ships:
@@ -9,10 +9,18 @@
 # no permission to write. Anything closer to it than this file is a pipeline
 # that fails on the first step that needs a secret.
 #
-# This workflow keeps the parts that matter here — the canonical build script,
-# the same compiler matrix, a real smoke test — and publishes only the GitHub
-# Release. Upstream's release.yml is left untouched so the fork can still merge
-# from it.
+# THE ARTIFACT SHAPE IS NOT OURS TO CHOOSE. install.sh, install.ps1 and the
+# binary's own `update` command all resolve a fixed, UNVERSIONED name
+# (codebase-memory-mcp-linux-amd64[-portable].tar.gz) and then require a FLAT
+# archive holding the binary, LICENSE, install.sh and THIRD_PARTY_NOTICES.md,
+# verified against a release-root checksums.txt. An earlier version of this
+# workflow invented versioned names, a nested directory, THIRD_PARTY.md and
+# per-file .sha256 sidecars, which nothing could install. scripts/
+# package-release.sh is the canonical packager that already produces the right
+# shape, so this workflow calls it rather than assembling archives by hand.
+#
+# Linux only. Upstream also ships darwin and windows; add rows to the matrix
+# below (and the matching runners) if this fork ever needs them.
 #
 # THE ALLOCATOR OVERRIDE IS CLEARED BY DEFAULT. On a 2026 gcc/glibc toolchain
 # the production build segfaults before main(): the Makefile forces
@@ -30,7 +38,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Version to tag and release (e.g. v0.1.0-local)"
+        description: "Version to tag and release (e.g. v0.1.1-local)"
         required: true
         type: string
       allocator_override:
@@ -52,16 +60,24 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: ubuntu-latest
+          - runner: ubuntu-24.04
             goos: linux
             goarch: amd64
-            cc: gcc
-            cxx: g++
+            static: false
+          # install.sh REQUESTS the -portable name on Linux unconditionally, so
+          # this leg is not optional: without it, a Linux install 404s.
+          - runner: ubuntu-24.04
+            goos: linux
+            goarch: amd64-portable
+            static: true
           - runner: ubuntu-24.04-arm
             goos: linux
             goarch: arm64
-            cc: gcc
-            cxx: g++
+            static: false
+          - runner: ubuntu-24.04-arm
+            goos: linux
+            goarch: arm64-portable
+            static: true
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
     steps:
@@ -85,26 +101,36 @@ jobs:
           echo "version=$V" >> "$GITHUB_OUTPUT"
 
       # Upstream's own build entry point — the single source of truth for
-      # release binaries, used identically by their CI. Clearing the two
-      # override defines is the only deviation, and only by default.
+      # release binaries, used identically by their CI.
       - name: Build
         env:
           VERSION: ${{ steps.ver.outputs.version }}
-          CC: ${{ matrix.cc }}
-          CXX: ${{ matrix.cxx }}
           OVERRIDE: ${{ inputs.allocator_override }}
+          STATIC: ${{ matrix.static }}
         run: |
           set -eux
+          # ${STATIC:+STATIC=1} would be wrong here: matrix.static arrives as the
+          # STRING "false", which is non-empty, so every leg would be built
+          # static. Compare explicitly.
+          STATIC_ARG=""
+          if [ "$STATIC" = "true" ]; then STATIC_ARG="STATIC=1"; fi
           if [ "$OVERRIDE" = "true" ]; then
-            scripts/build.sh --version "$VERSION" "CC=$CC" "CXX=$CXX"
+            scripts/build.sh --version "$VERSION" CC=gcc CXX=g++ $STATIC_ARG
           else
-            scripts/build.sh --version "$VERSION" "CC=$CC" "CXX=$CXX" \
+            scripts/build.sh --version "$VERSION" CC=gcc CXX=g++ $STATIC_ARG \
               GLOBAL_OVERRIDE_DEFINE= MIMALLOC_OVERRIDE_DEFINE=
           fi
 
+      # The portable leg exists so the binary runs on any distro. Assert that,
+      # rather than trusting the flag.
+      - name: Verify static linking
+        if: ${{ matrix.static }}
+        run: |
+          set -eux
+          file build/c/codebase-memory-mcp
+          ldd build/c/codebase-memory-mcp 2>&1 | grep -qE "not a dynamic executable|statically linked"
+
       # FAIL LOUDLY RATHER THAN SHIP A BINARY THAT CRASHES ON STARTUP.
-      # A --version that segfaults is the exact failure the override flag
-      # above exists to avoid, and it is cheap to detect here.
       - name: Smoke test
         run: |
           set -eux
@@ -114,6 +140,8 @@ jobs:
           grep -q . /tmp/version.txt
           "$BIN" --help > /dev/null
 
+      # The canonical packager owns the archive shape, the naming and the
+      # notices file, and it verifies the packaged bytes against this digest.
       - name: Package
         env:
           GOOS: ${{ matrix.goos }}
@@ -121,12 +149,14 @@ jobs:
           VERSION: ${{ steps.ver.outputs.version }}
         run: |
           set -eux
-          NAME="codebase-memory-mcp-${VERSION}-${GOOS}-${GOARCH}"
-          mkdir -p "dist/$NAME"
-          cp build/c/codebase-memory-mcp "dist/$NAME/"
-          cp LICENSE THIRD_PARTY.md "dist/$NAME/" 2>/dev/null || true
-          tar -C dist -czf "dist/$NAME.tar.gz" "$NAME"
-          ( cd dist && sha256sum "$NAME.tar.gz" > "$NAME.tar.gz.sha256" )
+          BIN=build/c/codebase-memory-mcp
+          SHA="$(sha256sum "$BIN" | cut -d' ' -f1)"
+          mkdir -p dist
+          VERSION="$VERSION" scripts/package-release.sh "$GOOS" "$GOARCH" \
+            --selected-binary "$BIN" \
+            --expected-sha256 "$SHA" \
+            --out-dir dist
+          rm -rf dist/.*.package.lock
           ls -la dist
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -135,12 +165,43 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+  # install.sh and the binary's `update` both download checksums.txt from the
+  # release root and verify against it. It has to cover every archive, so it is
+  # generated once, after all legs have produced theirs.
+  checksums:
+    name: checksums.txt
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums.txt
+        run: |
+          set -eux
+          cd dist
+          rm -f checksums.txt
+          # Archives and bundles only: the release also carries this file, and a
+          # checksum of itself cannot be self-consistent.
+          sha256sum $(ls *.tar.gz *.zip *.mcpb 2>/dev/null) > checksums.txt
+          cat checksums.txt
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dist-checksums
+          path: dist/checksums.txt
+          if-no-files-found: error
+
   release:
     name: publish release
-    needs: build
+    needs: [build, checksums]
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    timeout-minutes: 30
     steps:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -169,15 +230,17 @@ jobs:
           # with "fatal: not a git repository" -- which is exactly how the first
           # tag push failed.
           #
-          # Only the tarballs and their checksums are published. dist/ also
-          # holds the unpacked directories, and `dist/*` shipped those too.
+          # Only the real artifacts are attached; dist/ also collects the
+          # per-platform directories from the build legs, and `dist/*` once
+          # shipped those too.
           if gh release view "$VERSION" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release upload "$VERSION" dist/*.tar.gz dist/*.sha256 \
-              -R "$GITHUB_REPOSITORY" --clobber
+            gh release upload "$VERSION" dist/*.tar.gz dist/*.zip dist/*.mcpb \
+              dist/checksums.txt -R "$GITHUB_REPOSITORY" --clobber
           else
             # --generate-notes, not an empty --notes: a tag push has no workflow
             # input, so the old input-derived string was empty and produced a
             # release with a blank body.
-            gh release create "$VERSION" dist/*.tar.gz dist/*.sha256 \
-              -R "$GITHUB_REPOSITORY" --title "$VERSION" --generate-notes
+            gh release create "$VERSION" dist/*.tar.gz dist/*.zip dist/*.mcpb \
+              dist/checksums.txt -R "$GITHUB_REPOSITORY" \
+              --title "$VERSION" --generate-notes
           fi

@@ -108,6 +108,28 @@ int cbm_copy_binary_to_target(const char *src, const char *dst);
  * Returns 0 on success, -1 on error. */
 int cbm_replace_binary(const char *path, const unsigned char *data, int len, int mode);
 
+/* ── Release endpoints ────────────────────────────────────────── */
+
+/* The repository every install/update path points at.
+ *
+ * ONE definition, because four call sites must agree: the update check, the
+ * update download, the latest-tag probe, and the "leave a star" line.
+ *
+ * THIS FORK IS NOT UPSTREAM. Pointing these at DeusData/codebase-memory-mcp
+ * would make `codebase-memory-mcp update` fetch and install UPSTREAM's binary
+ * over this fork's, discarding the LLM enrichment -- and it would appear to
+ * succeed, which is the worst way to lose a feature.
+ *
+ * Overridable with -DCBM_RELEASE_REPO="owner/repo" for a rebuild under another
+ * owner; the string concatenation below keeps working because both forms are
+ * string literals. */
+#ifndef CBM_RELEASE_REPO
+#define CBM_RELEASE_REPO "theycallmeloki/codebase-memory-mcp"
+#endif
+#define CBM_RELEASE_HOMEPAGE "https://github.com/" CBM_RELEASE_REPO
+#define CBM_RELEASE_LATEST CBM_RELEASE_HOMEPAGE "/releases/latest"
+#define CBM_RELEASE_LATEST_DOWNLOAD CBM_RELEASE_LATEST "/download"
+
 /* ── Skill file management ────────────────────────────────────── */
 
 /* Number of skill files. */

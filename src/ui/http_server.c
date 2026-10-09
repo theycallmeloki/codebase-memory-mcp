@@ -18,6 +18,7 @@
 #include "ui/embedded_assets.h"
 #include "ui/layout3d.h"
 #include "mcp/mcp.h"
+#include "cli/cli.h" /* CBM_RELEASE_HOMEPAGE: the issue link goes to THIS fork */
 #include "store/store.h"
 #include "pipeline/pass_cross_repo.h"
 #include "watcher/watcher.h"
@@ -55,7 +56,7 @@
 #ifdef _WIN32
 #include <windows.h>
 #include <process.h>
-#include <psapi.h> /* GetProcessMemoryInfo */
+#include <psapi.h>    /* GetProcessMemoryInfo */
 #include <tlhelp32.h> /* CreateToolhelp32Snapshot, Process32First/Next */
 #else
 #include <sys/stat.h>
@@ -154,9 +155,8 @@ static void handle_ui_config(cbm_http_conn_t *c, const cbm_http_req_t *req) {
      * targets must come from an auditable backend response, same pattern as
      * the /api/repo-info deep-links). */
     cbm_http_replyf(c, 200, g_cors_json,
-                    "{\"lang\":\"%s\",\"version\":\"%s\",\"upstream_issues_url\":\"%s\"}",
-                    lang_buf, CBM_VERSION,
-                    "https://github.com/DeusData/codebase-memory-mcp/issues/new");
+                    "{\"lang\":\"%s\",\"version\":\"%s\",\"upstream_issues_url\":\"%s\"}", lang_buf,
+                    CBM_VERSION, CBM_RELEASE_HOMEPAGE "/issues/new");
 }
 
 /* ── Server state ─────────────────────────────────────────────── */
@@ -613,9 +613,8 @@ static void handle_processes(cbm_http_conn_t *c) {
         pe.dwSize = sizeof(pe);
         for (BOOL ok = Process32First(hSnap, &pe); ok; ok = Process32Next(hSnap, &pe)) {
             if (_stricmp(pe.szExeFile, "codebase-memory-mcp.exe") == 0) {
-                HANDLE hProc = OpenProcess(
-                    PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
-                    FALSE, pe.th32ProcessID);
+                HANDLE hProc = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE,
+                                           pe.th32ProcessID);
                 if (hProc) {
                     PROCESS_MEMORY_COUNTERS ppmc;
                     FILETIME ftc, fte, ftk, ftu;
@@ -658,13 +657,10 @@ static void handle_processes(cbm_http_conn_t *c) {
                                  "\"command\":\"codebase-memory-mcp\","
                                  "\"is_self\":%s}",
                                  pe.th32ProcessID, cpu_user + cpu_sys,
-                                 (double)proc_rss / (1024.0 * 1024.0),
-                                 elapsed_sec / 86400,
-                                 (elapsed_sec % 86400) / 3600,
-                                 (elapsed_sec % 3600) / 60,
+                                 (double)proc_rss / (1024.0 * 1024.0), elapsed_sec / 86400,
+                                 (elapsed_sec % 86400) / 3600, (elapsed_sec % 3600) / 60,
                                  elapsed_sec % 60,
-                                 pe.th32ProcessID == (DWORD)_getpid()
-                                     ? "true" : "false");
+                                 pe.th32ProcessID == (DWORD)_getpid() ? "true" : "false");
                     if (pos >= (int)sizeof(buf)) {
                         pos = (int)sizeof(buf) - 1;
                     }
@@ -727,7 +723,6 @@ static void handle_processes(cbm_http_conn_t *c) {
 }
 
 /* ── Directory browser ────────────────────────────────────────── */
-
 
 static void append_roots_json(char *buf, size_t bufsz, int *pos) {
     http_appendf(buf, bufsz, pos, ",\"roots\":[");
