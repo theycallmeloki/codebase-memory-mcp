@@ -11,10 +11,12 @@
 #include "foundation/platform.h" /* cbm_resolve_cache_dir, cbm_safe_getenv */
 #include "foundation/str_util.h" /* cbm_validate_project_name */
 #include "pipeline/llm_client.h"
+#include "pipeline/worker_pool.h"
 #include "store/store.h"
 
 #include "yyjson/yyjson.h"
 
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -26,6 +28,11 @@ enum {
     CL_MAX_CONTRACTS = 400, /* ceiling on the list; grouping is quadratic in prose */
     CL_EDGE_PROPS_CAP = 1024,
     CL_QN_CAP = 1024, /* one node's qualified name */
+    /* Collection capacities. These are starting points for on-demand growth, not
+     * ceilings: anything that CAPS the corpus silently drops work, and the drop
+     * is ordered by node id rather than by relevance. */
+    CL_MEMBER_INITIAL_CAP = 4096,
+    CL_CONTRACT_INITIAL_CAP = 4096,
 };
 
 /* The edge type this pass writes. Named here so the writer and any reader agree
@@ -123,6 +130,103 @@ static bool cl_contract_of(const char *properties_json, char *out, size_t outsz)
     return ok;
 }
 
+/* ── grouping machinery ─────────────────────────────────────────────────── */
+
+/* The contract corpus does not fit one prompt: the reference case has ~5000
+ * distinct contracts at ~256 chars each, so a single request would be ~1.3 MB
+ * against a 64 KB prompt ceiling — and the old fixed 400-contract list silently
+ * DROPPED 92% of the corpus, in node-id order, which biased the links that could
+ * ever be produced toward the first-indexed repo-root files. Instead each
+ * project PAIR is grouped separately, so a window always contains both sides of
+ * a possible cross-repository link, and each window is chunked to fit the
+ * prompt. Groups found in different windows are merged with a union-find, so
+ * overlap is not lost. */
+enum { CL_CHUNK_CONTRACTS = 400 };
+
+/* Union-find over distinct contracts. Iterative path compression: the contract
+ * corpus is large enough that recursion depth is not worth the risk. */
+static int cl_dsu_find(int *parent, int i) {
+    int root = i;
+    while (parent[root] != root) {
+        root = parent[root];
+    }
+    while (parent[i] != root) {
+        int next = parent[i];
+        parent[i] = root;
+        i = next;
+    }
+    return root;
+}
+
+static void cl_dsu_union(int *parent, int a, int b) {
+    int ra = cl_dsu_find(parent, a);
+    int rb = cl_dsu_find(parent, b);
+    if (ra == rb) {
+        return;
+    }
+    /* Lower index wins so the representative is stable and reproducible. */
+    if (ra < rb) {
+        parent[rb] = ra;
+    } else {
+        parent[ra] = rb;
+    }
+}
+
+/* Defined below with the rest of the request/parse pair; declared here because a
+ * chunk worker calls both. */
+static char *cl_build_request(const char *url, const char *model, const char *const *contracts,
+                              int count, int timeout_ms);
+static int cl_parse_groups(const char *response_json, int contract_count, int *group_of);
+
+/* One grouping request over a chunk of distinct contracts. */
+typedef struct {
+    const char *url;
+    const char *key;
+    const char *model;
+    int timeout_ms;
+    const char *const *distinct; /* the global contract list */
+    const int *globals;          /* global distinct indices in this chunk */
+    int count;
+    int *local_group; /* out: chunk-local group id per entry, -1 when unparsed */
+    bool ok;          /* out: request and parse both succeeded */
+    int groups;       /* out: distinct local group ids returned */
+} cl_chunk_t;
+
+/* Runs on a pool thread. Each chunk owns its output arrays, so no synchronisation
+ * is needed beyond the join at the end. */
+static void cl_chunk_run(int idx, void *ctx) {
+    cl_chunk_t *chunks = (cl_chunk_t *)ctx;
+    cl_chunk_t *c = &chunks[idx];
+    c->ok = false;
+    c->groups = 0;
+    const char **batch =
+        (const char **)cbm_alloc(CBM_MEM_CLASS_EXTRACT, sizeof(*batch) * (size_t)c->count);
+    if (!batch) {
+        return;
+    }
+    for (int i = 0; i < c->count; i++) {
+        batch[i] = c->distinct[c->globals[i]];
+    }
+    char *body = cl_build_request(c->url, c->model, batch, c->count, c->timeout_ms);
+    cbm_free(CBM_MEM_CLASS_EXTRACT, batch);
+    if (!body) {
+        return;
+    }
+    char *response = cbm_llm_post(c->url, c->key, body, c->timeout_ms);
+    free(body); /* cl_build_request -> yyjson_mut_write, the C allocator */
+    if (!response) {
+        return;
+    }
+    int groups = cl_parse_groups(response, c->count, c->local_group);
+    /* cbm_llm_post -> cbm_llm_read_file -> cbm_alloc, so it is NOT free()-able. */
+    cbm_free(CBM_MEM_CLASS_EXTRACT, response);
+    if (groups <= 0) {
+        return;
+    }
+    c->ok = true;
+    c->groups = groups;
+}
+
 /* ── the grouping call ──────────────────────────────────────────────────── */
 
 /* Ask the model which contracts enforce the same generalised rule.
@@ -158,9 +262,18 @@ static char *cl_build_request(const char *url, const char *model, const char *co
     yyjson_mut_obj_add_strcpy(doc, sys, "role", "system");
     yyjson_mut_obj_add_strcpy(
         doc, sys, "content",
-        "You group software invariants by the generalised rule they enforce, ignoring domain "
-        "vocabulary and library names. Two invariants belong together only if the SAME "
-        "generalised rule would justify linking the two files across a codebase boundary. "
+        "You group software invariants by the HAZARD each one guards against — the concrete "
+        "failure it makes impossible — and never by shared wording, shared vocabulary, or the "
+        "domain the file lives in. Two invariants belong together when the same underlying "
+        "hazard, stated in each file's own terms, is what they prevent; a reader asking about "
+        "that hazard should be sent to both. Look past surface phrasing: the same hazard is "
+        "usually described with entirely different nouns in different libraries. Say an "
+        "invariant guards against a lookup or correlation key that is derived from only PART "
+        "of what makes two cases distinct, so that two logically different things can collide "
+        "onto one key — invariants preventing that failure belong together even when one is "
+        "about a cache, another about row selection, and a third about entity storage. "
+        "Conversely, do NOT group invariants merely because they use similar words: two rules "
+        "that both mention 'resolving a relative path' share wording, not necessarily hazard. "
         "Reply with JSON only: {\"groups\": [[<1-based indices>], ...]}. Include every index "
         "exactly once; put an invariant that matches nothing else in a group of its own.");
     yyjson_mut_arr_add_val(messages, sys);
@@ -378,11 +491,13 @@ int cbm_contract_link_run(const char *source_project, const char *const *targets
     }
 
     /* ── 2. collect every file that carries a contract ────────────────────── */
-    cl_member_t *members = (cl_member_t *)cbm_alloc(CBM_MEM_CLASS_EXTRACT,
-                                                    sizeof(*members) * (size_t)CL_MAX_CONTRACTS * 8);
-    if (!members) {
-        return -1;
-    }
+    /* Grown on demand. A fixed ceiling here silently discarded half the corpus
+     * (the reference case has 5013 files carrying a contract), and WHICH half
+     * survived was decided by node-id order — i.e. by indexing order, which for
+     * a repo means its root-level files first. That biased the links the pass
+     * could ever produce toward repo-root prose and away from source. */
+    cl_member_t *members = NULL;
+    int member_cap = 0;
     int member_count = 0;
 
     for (int p = 0; p < proj.count; p++) {
@@ -404,8 +519,15 @@ int cbm_contract_link_run(const char *source_project, const char *const *targets
                     continue;
                 }
                 out->files_with_contract++;
-                if (member_count >= CL_MAX_CONTRACTS * 8) {
-                    continue; /* ceiling reached: keep counting, stop storing */
+                if (member_count == member_cap) {
+                    int next_cap = member_cap ? member_cap * 2 : CL_MEMBER_INITIAL_CAP;
+                    cl_member_t *grown = (cl_member_t *)cbm_realloc(
+                        CBM_MEM_CLASS_EXTRACT, members, sizeof(*grown) * (size_t)next_cap);
+                    if (!grown) {
+                        continue; /* out of room: keep counting, stop storing */
+                    }
+                    members = grown;
+                    member_cap = next_cap;
                 }
                 cl_member_t *m = &members[member_count++];
                 m->node_id = nodes[i].id;
@@ -429,16 +551,19 @@ int cbm_contract_link_run(const char *source_project, const char *const *targets
         goto done;
     }
 
-    /* ── 3. the distinct contracts, in first-seen order ───────────────────── */
-    char **distinct = (char **)cbm_alloc(CBM_MEM_CLASS_EXTRACT, sizeof(*distinct) * CL_MAX_CONTRACTS);
-    int *group_of = (int *)cbm_alloc(CBM_MEM_CLASS_EXTRACT, sizeof(*group_of) * CL_MAX_CONTRACTS);
-    int *index_of = (int *)cbm_alloc(CBM_MEM_CLASS_EXTRACT, sizeof(*index_of) * (size_t)member_count);
-    if (!distinct || !group_of || !index_of) {
+    /* ── 3. the distinct contracts, plus which projects carry each ────────── */
+    char **distinct = NULL;
+    uint64_t *carriers = NULL; /* bit t set when project t carries this contract */
+    int distinct_cap = 0;
+    int *index_of =
+        (int *)cbm_alloc(CBM_MEM_CLASS_EXTRACT, sizeof(*index_of) * (size_t)member_count);
+    if (!index_of) {
         cbm_free(CBM_MEM_CLASS_EXTRACT, members);
         return -1;
     }
     int distinct_count = 0;
-    for (int i = 0; i < member_count; i++) {
+    bool oom = false;
+    for (int i = 0; i < member_count && !oom; i++) {
         int found = -1;
         for (int d = 0; d < distinct_count; d++) {
             if (strcmp(distinct[d], members[i].contract) == 0) {
@@ -447,22 +572,58 @@ int cbm_contract_link_run(const char *source_project, const char *const *targets
             }
         }
         if (found < 0) {
-            if (distinct_count >= CL_MAX_CONTRACTS) {
-                index_of[i] = -1;
-                continue;
+            if (distinct_count == distinct_cap) {
+                int next_cap = distinct_cap ? distinct_cap * 2 : CL_CONTRACT_INITIAL_CAP;
+                char **grown =
+                    (char **)cbm_realloc(CBM_MEM_CLASS_EXTRACT, distinct,
+                                         sizeof(*grown) * (size_t)next_cap);
+                if (!grown) {
+                    oom = true;
+                    break;
+                }
+                distinct = grown;
+                uint64_t *grown_mask =
+                    (uint64_t *)cbm_realloc(CBM_MEM_CLASS_EXTRACT, carriers,
+                                            sizeof(*grown_mask) * (size_t)next_cap);
+                if (!grown_mask) {
+                    oom = true;
+                    break;
+                }
+                carriers = grown_mask;
+                distinct_cap = next_cap;
             }
-            found = distinct_count;
-            distinct[distinct_count++] = members[i].contract;
+            found = distinct_count++;
+            /* Points into members[], which is fully built by now and never
+             * grown again — reallocating it would dangle these. */
+            distinct[found] = members[i].contract;
+            carriers[found] = 0;
         }
         index_of[i] = found;
+        carriers[found] |= (uint64_t)1 << (unsigned)members[i].project_idx;
     }
     out->distinct_contracts = distinct_count;
-    if (distinct_count < 2) {
-        cbm_log_info("contract_link.skip", "reason", "one_distinct_contract");
-        goto cleanup;
+    if (oom || distinct_count < 2) {
+        if (!oom) {
+            cbm_log_info("contract_link.skip", "reason", "one_distinct_contract");
+        }
+        cbm_free(CBM_MEM_CLASS_EXTRACT, carriers);
+        cbm_free(CBM_MEM_CLASS_EXTRACT, distinct);
+        cbm_free(CBM_MEM_CLASS_EXTRACT, index_of);
+        goto done;
+    }
+    /* Union-find parent over distinct contracts; the edge loop compares roots. */
+    int *group_of = (int *)cbm_alloc(CBM_MEM_CLASS_EXTRACT, sizeof(*group_of) * (size_t)distinct_count);
+    if (!group_of) {
+        cbm_free(CBM_MEM_CLASS_EXTRACT, carriers);
+        cbm_free(CBM_MEM_CLASS_EXTRACT, distinct);
+        cbm_free(CBM_MEM_CLASS_EXTRACT, index_of);
+        goto done;
+    }
+    for (int d = 0; d < distinct_count; d++) {
+        group_of[d] = d;
     }
 
-    /* ── 4. one grouping call ─────────────────────────────────────────────── */
+    /* ── 4. group every project PAIR, in chunks, in parallel ──────────────── */
     {
         char url[CBM_PATH_MAX];
         char key[CBM_PATH_MAX];
@@ -479,47 +640,173 @@ int cbm_contract_link_run(const char *source_project, const char *const *targets
             timeout_ms = 300000;
         }
         if (!url[0]) {
-            cbm_log_info("contract_link.skip", "reason", "no_llm_url");
-            goto cleanup;
-        }
-        char *body = cl_build_request(url, model, (const char *const *)distinct, distinct_count,
-                                      timeout_ms);
-        if (!body) {
-            goto cleanup;
-        }
-        char *response = cbm_llm_post(url, key, body, timeout_ms);
-        free(body);
-        if (!response) {
             /* Unreachable model: write nothing. A guessed grouping would assert
              * a relationship between two files that may not exist. */
-            cbm_log_info("contract_link.skip", "reason", "no_response");
-            goto cleanup;
+            cbm_log_info("contract_link.skip", "reason", "no_llm_url");
+        } else {
+            /* Window contents: for pair (a,b), every contract either project
+             * carries. Windows are built for a pair so both ends of a possible
+             * cross-repository link are always visible together — a flat window
+             * over the whole corpus cannot group a db contract with a query one,
+             * which is the only link this pass exists to produce.
+             *
+             * Sizes are computed first and `sel` allocated once, because chunk
+             * descriptors hold pointers INTO it and growing it afterwards would
+             * dangle them. */
+            size_t sel_need = 0;
+            for (int a = 0; a < proj.count; a++) {
+                for (int b = a + 1; b < proj.count; b++) {
+                    uint64_t want = ((uint64_t)1 << (unsigned)a) | ((uint64_t)1 << (unsigned)b);
+                    for (int d = 0; d < distinct_count; d++) {
+                        if (carriers[d] & want) {
+                            sel_need++;
+                        }
+                    }
+                }
+            }
+            int chunk_count = 0;
+            for (size_t off = 0; off < sel_need; off += CL_CHUNK_CONTRACTS) {
+                chunk_count++;
+            }
+            int *sel = sel_need ? (int *)cbm_alloc(CBM_MEM_CLASS_EXTRACT,
+                                                   sizeof(*sel) * sel_need) : NULL;
+            cl_chunk_t *chunks =
+                chunk_count ? (cl_chunk_t *)cbm_alloc(CBM_MEM_CLASS_EXTRACT,
+                                                      sizeof(*chunks) * (size_t)chunk_count)
+                            : NULL;
+            if (chunk_count == 0 || !sel || !chunks) {
+                cbm_free(CBM_MEM_CLASS_EXTRACT, sel);
+                cbm_free(CBM_MEM_CLASS_EXTRACT, chunks);
+                cbm_log_info("contract_link.skip", "reason", "no_cross_project_candidates");
+            } else {
+                int written = 0;
+                int made = 0;
+                bool alloc_ok = true;
+                for (int a = 0; a < proj.count && alloc_ok; a++) {
+                    for (int b = a + 1; b < proj.count && alloc_ok; b++) {
+                        uint64_t want =
+                            ((uint64_t)1 << (unsigned)a) | ((uint64_t)1 << (unsigned)b);
+                        int start = written;
+                        for (int d = 0; d < distinct_count; d++) {
+                            if (carriers[d] & want) {
+                                sel[written++] = d;
+                            }
+                        }
+                        for (int off = start; off < written; off += CL_CHUNK_CONTRACTS) {
+                            int n = written - off;
+                            if (n > CL_CHUNK_CONTRACTS) {
+                                n = CL_CHUNK_CONTRACTS;
+                            }
+                            int *local = (int *)cbm_alloc(CBM_MEM_CLASS_EXTRACT,
+                                                          sizeof(*local) * (size_t)n);
+                            if (!local) {
+                                alloc_ok = false;
+                                break;
+                            }
+                            chunks[made++] = (cl_chunk_t){
+                                .url = url,
+                                .key = key,
+                                .model = model,
+                                .timeout_ms = timeout_ms,
+                                .distinct = (const char *const *)distinct,
+                                .globals = &sel[off],
+                                .count = n,
+                                .local_group = local,
+                                .ok = false,
+                                .groups = 0,
+                            };
+                        }
+                    }
+                }
+                if (!alloc_ok) {
+                    for (int i = 0; i < made; i++) {
+                        cbm_free(CBM_MEM_CLASS_EXTRACT, chunks[i].local_group);
+                    }
+                    cbm_free(CBM_MEM_CLASS_EXTRACT, sel);
+                    cbm_free(CBM_MEM_CLASS_EXTRACT, chunks);
+                    cbm_log_info("contract_link.skip", "reason", "out_of_memory");
+                } else {
+                    char conc_buf[CBM_SZ_32];
+                    (void)cbm_safe_getenv("CBM_LLM_CONCURRENCY", conc_buf, sizeof(conc_buf), "8");
+                    int workers = atoi(conc_buf);
+                    if (workers <= 0) {
+                        workers = 8;
+                    }
+                    cbm_parallel_for_opts_t opts;
+                    memset(&opts, 0, sizeof(opts));
+                    opts.max_workers = workers;
+                    cbm_parallel_for(made, cl_chunk_run, chunks, opts);
+
+                    int answered = 0;
+                    for (int i = 0; i < made; i++) {
+                        cl_chunk_t *c = &chunks[i];
+                        if (c->ok) {
+                            answered++;
+                        }
+                        /* Merge within one chunk: every entry sharing a returned
+                         * group id becomes one group globally. */
+                        for (int x = 0; x < c->count; x++) {
+                            if (c->local_group[x] < 0) {
+                                continue;
+                            }
+                            for (int y = x + 1; y < c->count; y++) {
+                                if (c->local_group[y] == c->local_group[x]) {
+                                    cl_dsu_union(group_of, c->globals[x], c->globals[y]);
+                                }
+                            }
+                        }
+                    }
+                    out->model_answered = answered > 0;
+                    /* A group of one links nothing, so report only merged groups. */
+                    int merged = 0;
+                    {
+                        int *sizes = (int *)cbm_alloc(CBM_MEM_CLASS_EXTRACT,
+                                                      sizeof(*sizes) * (size_t)distinct_count);
+                        if (sizes) {
+                            for (int d = 0; d < distinct_count; d++) {
+                                sizes[d] = 0;
+                            }
+                            for (int d = 0; d < distinct_count; d++) {
+                                sizes[cl_dsu_find(group_of, d)]++;
+                            }
+                            for (int d = 0; d < distinct_count; d++) {
+                                if (group_of[d] == d && sizes[d] >= 2) {
+                                    merged++;
+                                }
+                            }
+                            cbm_free(CBM_MEM_CLASS_EXTRACT, sizes);
+                        }
+                    }
+                    out->groups = merged;
+                    {
+                        char chunk_buf[CBM_SZ_32];
+                        char answered_buf[CBM_SZ_32];
+                        cbm_log_info("contract_link.stage", "step", "grouped", "chunks",
+                                     cl_i2s(chunk_buf, sizeof(chunk_buf), made), "answered",
+                                     cl_i2s(answered_buf, sizeof(answered_buf), answered));
+                    }
+                    for (int i = 0; i < made; i++) {
+                        cbm_free(CBM_MEM_CLASS_EXTRACT, chunks[i].local_group);
+                    }
+                    cbm_free(CBM_MEM_CLASS_EXTRACT, sel);
+                    cbm_free(CBM_MEM_CLASS_EXTRACT, chunks);
+                }
+            }
         }
-        int groups = cl_parse_groups(response, distinct_count, group_of);
-        /* cbm_llm_post -> cbm_llm_read_file -> cbm_alloc(CBM_MEM_CLASS_EXTRACT).
-         * Freeing that with free() hands an untracked pointer to glibc and the
-         * process aborts inside malloc. Same pairing as pass_llm_enrich. */
-        cbm_free(CBM_MEM_CLASS_EXTRACT, response);
-        if (groups <= 0) {
-            /* Also the finish=length case, where content is empty. Reported
-             * distinctly from "nothing in common" because the remedy differs. */
-            cbm_log_info("contract_link.skip", "reason", "no_groups_parsed");
-            goto cleanup;
-        }
-        out->model_answered = true;
-        out->groups = groups;
     }
 
     /* ── 5. edges between members of the same group in DIFFERENT projects ─── */
     for (int a = 0; a < member_count; a++) {
-        if (index_of[a] < 0 || group_of[index_of[a]] < 0) {
+        if (index_of[a] < 0) {
             continue;
         }
         for (int b = a + 1; b < member_count; b++) {
-            if (index_of[b] < 0 || group_of[index_of[b]] < 0) {
+            if (index_of[b] < 0) {
                 continue;
             }
-            if (group_of[index_of[a]] != group_of[index_of[b]]) {
+            /* Union-find roots, not raw ids: the same group can be discovered by
+             * several pair windows and must compare equal across them. */
+            if (cl_dsu_find(group_of, index_of[a]) != cl_dsu_find(group_of, index_of[b])) {
                 continue;
             }
             if (members[a].project_idx == members[b].project_idx) {
@@ -550,7 +837,10 @@ int cbm_contract_link_run(const char *source_project, const char *const *targets
         }
     }
 
-cleanup:
+    /* Section 3's arrays are freed here on the normal path; the early OOM exit
+     * above frees them itself and jumps straight to done, so nothing is freed
+     * twice. */
+    cbm_free(CBM_MEM_CLASS_EXTRACT, carriers);
     cbm_free(CBM_MEM_CLASS_EXTRACT, index_of);
     cbm_free(CBM_MEM_CLASS_EXTRACT, group_of);
     cbm_free(CBM_MEM_CLASS_EXTRACT, distinct);
