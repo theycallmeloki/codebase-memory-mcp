@@ -158,6 +158,9 @@ static int resolve_usage_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
     cbm_pipeline_lsp_field_index_t field_index = {0};
     bool field_index_ready =
         cbm_pipeline_lsp_field_index_build(&result->resolved_calls, &field_index);
+    /* imp_keys is the IMPORTS-edge map (cbm_pxc_build_import_map). */
+    cbm_php_vendor_names_t php_vendor;
+    cbm_pipeline_php_vendor_names_build(ctx->gbuf, ctx->project_name, rel, result, &php_vendor);
     for (int u = 0; u < result->usages.count; u++) {
         CBMUsage *usage = &result->usages.items[u];
         if (!usage->ref_name) {
@@ -238,6 +241,11 @@ static int resolve_usage_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
             if (semantic_reference) {
                 continue;
             }
+            /* #1186: a PHP name imported from a vendor namespace is not the
+             * same-named project symbol. Mirrors pass_parallel.c. */
+            if (cbm_pipeline_php_vendor_usage(&php_vendor, result, usage)) {
+                continue;
+            }
             /* SQL usages are FROM/JOIN lineage refs and may bind Table/View
              * targets (cbm_registry_resolve_lineage); every other language
              * resolves through the default variant, whose central relation
@@ -246,8 +254,8 @@ static int resolve_usage_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
                 (lang == CBM_LANG_SQL)
                     ? cbm_registry_resolve_lineage(ctx->registry, usage->ref_name, module_qn,
                                                    imp_keys, imp_vals, imp_count)
-                    : cbm_registry_resolve(ctx->registry, usage->ref_name, module_qn, imp_keys,
-                                           imp_vals, imp_count);
+                    : cbm_registry_resolve_lang(ctx->registry, usage->ref_name, module_qn, imp_keys,
+                                                imp_vals, imp_count, lang);
             if (!res.qualified_name || res.qualified_name[0] == '\0') {
                 continue;
             }
@@ -255,7 +263,12 @@ static int resolve_usage_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
                                                                    imp_keys, imp_count)) {
                 continue;
             }
-            tgt = cbm_gbuf_find_by_qn(ctx->gbuf, res.qualified_name);
+            /* a plain value reference names the field twin of a same-named
+             * method; a callable-reference candidate keeps the method */
+            bool value_ref = usage->kind == CBM_USAGE_VALUE && !usage->may_be_call_reference;
+            tgt = cbm_gbuf_find_by_qn(
+                ctx->gbuf, value_ref ? cbm_registry_value_target(ctx->registry, res.qualified_name)
+                                     : res.qualified_name);
             /* #1928: the registry fallback is a bare-name guess — never let it
              * bind a reference across a language boundary (the LSP-backed
              * semantic branch above is not affected). */
@@ -289,13 +302,14 @@ static int resolve_usage_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
     }
     cbm_pipeline_lsp_reference_index_free(&reference_index);
     cbm_pipeline_lsp_field_index_free(&field_index);
+    cbm_pipeline_php_vendor_names_free(&php_vendor);
     return resolved;
 }
 
 /* Resolve THROWS/RAISES edges for one file's extracted throws. */
 static int resolve_throw_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result,
                                const char *rel, const char *module_qn, const char **imp_keys,
-                               const char **imp_vals, int imp_count) {
+                               const char **imp_vals, int imp_count, CBMLanguage lang) {
     int resolved = 0;
     for (int t = 0; t < result->throws.count; t++) {
         CBMThrow *thr = &result->throws.items[t];
@@ -309,8 +323,8 @@ static int resolve_throw_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
         }
 
         const char *edge_type = is_checked_exception(thr->exception_name) ? "THROWS" : "RAISES";
-        cbm_resolution_t res = cbm_registry_resolve(ctx->registry, thr->exception_name, module_qn,
-                                                    imp_keys, imp_vals, imp_count);
+        cbm_resolution_t res = cbm_registry_resolve_lang(
+            ctx->registry, thr->exception_name, module_qn, imp_keys, imp_vals, imp_count, lang);
 
         const cbm_gbuf_node_t *tgt = NULL;
         if (res.qualified_name && res.qualified_name[0]) {
@@ -375,13 +389,14 @@ static int resolve_rw_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result
             continue;
         }
 
-        cbm_resolution_t res = cbm_registry_resolve(ctx->registry, rw->var_name, module_qn,
-                                                    imp_keys, imp_vals, imp_count);
+        cbm_resolution_t res = cbm_registry_resolve_lang(ctx->registry, rw->var_name, module_qn,
+                                                         imp_keys, imp_vals, imp_count, lang);
         if (!res.qualified_name || res.qualified_name[0] == '\0') {
             continue;
         }
 
-        const cbm_gbuf_node_t *tgt = cbm_gbuf_find_by_qn(ctx->gbuf, res.qualified_name);
+        const cbm_gbuf_node_t *tgt = cbm_gbuf_find_by_qn(
+            ctx->gbuf, cbm_registry_value_target(ctx->registry, res.qualified_name));
         if (!tgt || src->id == tgt->id) {
             continue;
         }
@@ -478,8 +493,8 @@ int cbm_pipeline_pass_usages(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *fil
 
         usage_resolved += resolve_usage_edges(ctx, result, rel, module_qn, imp_keys, imp_vals,
                                               imp_count, files[i].language);
-        throw_resolved +=
-            resolve_throw_edges(ctx, result, rel, module_qn, imp_keys, imp_vals, imp_count);
+        throw_resolved += resolve_throw_edges(ctx, result, rel, module_qn, imp_keys, imp_vals,
+                                              imp_count, files[i].language);
         rw_resolved += resolve_rw_edges(ctx, result, rel, module_qn, imp_keys, imp_vals, imp_count,
                                         files[i].language);
 

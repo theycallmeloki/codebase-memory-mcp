@@ -1,5 +1,6 @@
 #include "cbm.h"
-#include "arena.h" // CBMArena, cbm_arena_alloc/strdup/sprintf
+#include "arena.h"   // CBMArena, cbm_arena_alloc/strdup/sprintf
+#include "doclink.h" // cbm_doclink_note_doc_line
 #include "helpers.h"
 #include "lang_specs.h"
 #include "foundation/constants.h"
@@ -220,7 +221,8 @@ static void walk_defs(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec, 
 static void extract_variables(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec);
 static void extract_var_names(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec);
 static void extract_class_variables(CBMExtractCtx *ctx, TSNode class_node, const char *class_qn,
-                                    const CBMLangSpec *spec);
+                                    const CBMLangSpec *spec, int fields_from);
+static void fence_fields_named_like_methods(CBMExtractCtx *ctx, int methods_from, int fields_from);
 static void extract_rust_impl(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec);
 static void extract_class_methods(CBMExtractCtx *ctx, TSNode class_node, const char *class_qn,
                                   const CBMLangSpec *spec);
@@ -1366,6 +1368,7 @@ typedef struct {
     doc_span_t *items; /* trivia directly before the anchor, in source order */
     int count;
     int cap;
+    bool failed;           /* a missing span must not become shared documentation */
     bool code_before;      /* a non-trivia sibling precedes items[0] */
     uint32_t code_erow;    /* ... its effective end row */
     uint32_t code_eb;      /* ... its end byte (Kotlin gap scan) */
@@ -1493,8 +1496,17 @@ static doc_span_t doc_span_of(TSNode n, const char *src, uint8_t kind) {
 static void doc_push_span(CBMArena *a, doc_trivia_t *t, const doc_span_t *sp) {
     if (t->count == t->cap) {
         int ncap = t->cap ? t->cap * DOC_SPAN_GROW : DOC_SPAN_INIT_CAP;
-        doc_span_t *grown = (doc_span_t *)cbm_arena_alloc(a, (size_t)ncap * sizeof(doc_span_t));
+        doc_span_t *grown;
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+        if (cbm_doclink_test_fail_alloc(CBM_DOCLINK_ALLOC_SPAN)) {
+            grown = NULL;
+        } else
+#endif
+        {
+            grown = (doc_span_t *)cbm_arena_alloc(a, (size_t)ncap * sizeof(doc_span_t));
+        }
         if (!grown) {
+            t->failed = true;
             return;
         }
         if (t->count > 0) {
@@ -1917,6 +1929,15 @@ static void doc_collect_kotlin(CBMExtractCtx *ctx, TSNode parent, TSNode anchor,
     }
 }
 
+/* A doc comment was lost because memory ran out. For a language whose doc
+ * comments are read for links, the doc-link layer must not then report a
+ * complete graph (CBMDocLinkArray.failed). */
+static void doc_lost(CBMExtractCtx *ctx) {
+    if (ctx->result && cbm_doclink_lang_supported(ctx->language)) {
+        ctx->result->doc_links.failed = true;
+    }
+}
+
 /* Leading trivia of `anchor`, in source order. */
 static void doc_collect_trivia(CBMExtractCtx *ctx, TSNode anchor, doc_trivia_t *t) {
     memset(t, 0, sizeof(*t));
@@ -1933,11 +1954,14 @@ static void doc_collect_trivia(CBMExtractCtx *ctx, TSNode anchor, doc_trivia_t *
         found = doc_collect_cursor(ctx, parent, anchor, t);
     }
     if (!found) {
+        bool failed = t->failed;
         memset(t, 0, sizeof(*t));
-        return;
-    }
-    if (t->count == 0 && ctx->language == CBM_LANG_KOTLIN) {
+        t->failed = failed;
+    } else if (t->count == 0 && ctx->language == CBM_LANG_KOTLIN) {
         doc_collect_kotlin(ctx, parent, anchor, t);
+    }
+    if (t->failed) {
+        doc_lost(ctx);
     }
 }
 
@@ -2034,10 +2058,14 @@ static const char *doc_run_text(CBMExtractCtx *ctx, const doc_trivia_t *t, int f
     int kept = 0;
     bool words = false;
     size_t total = 0;
+    uint32_t first_row = 0;
     for (int k = first; k <= last; k++) {
         const doc_span_t *sp = &t->items[k];
         if (!doc_span_kept(src, sp, go_directives)) {
             continue;
+        }
+        if (kept == 0) {
+            first_row = sp->srow;
         }
         total += (size_t)(sp->eb - sp->sb) + SKIP_ONE;
         words = words || doc_has_words(src + sp->sb, sp->eb - sp->sb);
@@ -2046,8 +2074,17 @@ static const char *doc_run_text(CBMExtractCtx *ctx, const doc_trivia_t *t, int f
     if (kept == 0 || !words) {
         return NULL;
     }
-    char *buf = (char *)cbm_arena_alloc(ctx->arena, total + SKIP_ONE);
+    char *buf;
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+    if (cbm_doclink_test_fail_alloc(CBM_DOCLINK_ALLOC_TEXT)) {
+        buf = NULL;
+    } else
+#endif
+    {
+        buf = (char *)cbm_arena_alloc(ctx->arena, total + SKIP_ONE);
+    }
     if (!buf) {
+        doc_lost(ctx);
         return NULL;
     }
     size_t w = 0;
@@ -2065,9 +2102,16 @@ static const char *doc_run_text(CBMExtractCtx *ctx, const doc_trivia_t *t, int f
             buf[w++] = '\n';
         }
         memcpy(buf + w, src + sp->sb, eb - sp->sb);
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+        cbm_doclink_test_note_doc_work(eb - sp->sb, 0, 0);
+#endif
         w += eb - sp->sb;
     }
     buf[w] = '\0';
+    /* Doc-link references need their source lines: the text's line k is the
+     * source line first_row + k (one comment per line, or a block keeping
+     * its own newlines). */
+    cbm_doclink_note_doc_line(ctx, buf, first_row + SKIP_ONE);
     return buf;
 }
 
@@ -2149,10 +2193,17 @@ static const char *doc_from_trivia(CBMExtractCtx *ctx, const doc_trivia_t *t,
     return doc_run_text(ctx, t, doc_run_first(lang, t, near), near, lang == CBM_LANG_GO);
 }
 
-static const char *doc_for_anchor(CBMExtractCtx *ctx, TSNode anchor) {
+static const char *doc_for_anchor_status(CBMExtractCtx *ctx, TSNode anchor, bool *complete) {
     doc_trivia_t t;
     doc_collect_trivia(ctx, anchor, &t);
+    if (complete) {
+        *complete = !t.failed;
+    }
     return doc_from_trivia(ctx, &t, ts_node_start_point(anchor).row);
+}
+
+static const char *doc_for_anchor(CBMExtractCtx *ctx, TSNode anchor) {
+    return doc_for_anchor_status(ctx, anchor, NULL);
 }
 
 static bool doc_kind_is(TSNode n, const char *kind) {
@@ -2276,6 +2327,7 @@ typedef struct {
     size_t name_len;
     uint32_t sb;
     uint32_t eb;
+    bool used; /* a sub's doc holds it (pod_doc_by_name): not the module's */
 } pod_sec_t;
 
 typedef struct {
@@ -2536,15 +2588,16 @@ static void pod_index_block(CBMExtractCtx *ctx, pod_index_t *ix, TSNode pod) {
             continue;
         }
         uint32_t se = pod_section_end(cmds, n, ci, pe);
-        pod_sec_t sec = {nm, nl, cmds[ci].sb, pod_trim_end(ctx->source, cmds[ci].sb, se)};
+        pod_sec_t sec = {nm, nl, cmds[ci].sb, pod_trim_end(ctx->source, cmds[ci].sb, se), false};
         pod_index_push(a, ix, &sec);
     }
 }
 
-/* The file's POD sections by name, built on the first Perl sub. */
-static const pod_index_t *pod_index(CBMExtractCtx *ctx) {
+/* The file's POD sections by name, built on the first Perl sub (or for the
+ * module doc of a file without one). */
+static pod_index_t *pod_index(CBMExtractCtx *ctx) {
     if (ctx->doc_pod_index) {
-        return (const pod_index_t *)ctx->doc_pod_index;
+        return (pod_index_t *)ctx->doc_pod_index;
     }
     pod_index_t *ix = (pod_index_t *)cbm_arena_alloc(doc_scratch(ctx), sizeof(pod_index_t));
     if (!ix) {
@@ -2572,7 +2625,7 @@ static bool pod_sec_names(const pod_sec_t *s, const char *name, size_t nl) {
 /* Every POD section whose =head / =item names the sub exactly, joined in
  * document order; NULL when none does. */
 static const char *pod_doc_by_name(CBMExtractCtx *ctx, const char *name) {
-    const pod_index_t *ix = pod_index(ctx);
+    pod_index_t *ix = pod_index(ctx);
     if (!ix || !name || !name[0]) {
         return NULL;
     }
@@ -2592,10 +2645,11 @@ static const char *pod_doc_by_name(CBMExtractCtx *ctx, const char *name) {
     }
     size_t w = 0;
     for (int i = 0; i < ix->count; i++) {
-        const pod_sec_t *s = &ix->items[i];
+        pod_sec_t *s = &ix->items[i];
         if (!pod_sec_names(s, name, nl)) {
             continue;
         }
+        s->used = true;
         if (w > 0) {
             buf[w++] = '\n';
             buf[w++] = '\n';
@@ -2605,6 +2659,137 @@ static const char *pod_doc_by_name(CBMExtractCtx *ctx, const char *name) {
     }
     buf[w] = '\0';
     return buf;
+}
+
+/* True when src[b, e) holds a paragraph that is text, or a =head / =item
+ * command: not only =cut, =pod, =over and =back lines. */
+static bool pod_run_has_text(const char *src, uint32_t b, uint32_t e) {
+    uint32_t pos = b;
+    uint32_t sb = 0;
+    uint32_t eb = 0;
+    int depth = 0;
+    while (pod_next_para(src, &pos, e, &sb, &eb)) {
+        if (src[sb] != '=' || sb + SKIP_ONE >= eb || !isalpha((unsigned char)src[sb + SKIP_ONE])) {
+            return true;
+        }
+        pod_cmd_t c = pod_classify(src, sb, eb, &depth);
+        if (c.type == POD_HEAD || c.type == POD_ITEM || c.type == POD_OTHER) {
+            return true;
+        }
+    }
+    return false;
+}
+
+typedef struct {
+    CBMExtractCtx *ctx;
+    char *buf;
+    size_t w;
+    uint32_t first_line; /* source line of the first run kept, 0 before it */
+    TSNode block;
+    int next_sec; /* the first index section not yet passed: blocks go in order */
+} pod_module_t;
+
+/* Append src[b, e) of the current block to the module doc, after a blank
+ * line, unless it holds no text. */
+static void pod_module_run(pod_module_t *m, uint32_t b, uint32_t e) {
+    const char *src = m->ctx->source;
+    while (b < e) { /* leading blank lines */
+        uint32_t le = b;
+        while (le < e && src[le] != '\n') {
+            le++;
+        }
+        if (!pod_line_is_blank(src, b, le)) {
+            break;
+        }
+        b = le < e ? le + SKIP_ONE : e;
+    }
+    e = pod_trim_end(src, b, e);
+    if (b >= e || !pod_run_has_text(src, b, e)) {
+        return;
+    }
+    if (m->first_line == 0) {
+        uint32_t line = ts_node_start_point(m->block).row + SKIP_ONE;
+        for (uint32_t k = ts_node_start_byte(m->block); k < b; k++) {
+            line += src[k] == '\n' ? SKIP_ONE : 0;
+        }
+        m->first_line = line;
+    }
+    if (m->w > 0) {
+        m->buf[m->w++] = '\n';
+        m->buf[m->w++] = '\n';
+    }
+    memcpy(m->buf + m->w, src + b, e - b);
+    m->w += e - b;
+}
+
+/* Perl's module doc, for the File node: the file's POD outside the sections a
+ * sub's doc holds, so that no reference is read twice. Every POD block with
+ * those sections cut out, each remaining run as it is in the source, in
+ * document order and joined by a blank line (a sub's doc joins its sections
+ * the same way); a run of only =cut / =pod / =over / =back lines is dropped.
+ * Built after the definitions, which mark the sections they take. NULL when
+ * nothing is left. */
+static const char *doc_perl_module(CBMExtractCtx *ctx) {
+    pod_index_t *ix = pod_index(ctx);
+    if (!ix) {
+        return NULL;
+    }
+    size_t total = 0;
+    int blocks = 0;
+    TSTreeCursor cur = ts_tree_cursor_new(ctx->root);
+    if (ts_tree_cursor_goto_first_child(&cur)) {
+        do {
+            TSNode ch = ts_tree_cursor_current_node(&cur);
+            if (strcmp(ts_node_type(ch), "pod") == 0) {
+                total += ts_node_end_byte(ch) - ts_node_start_byte(ch);
+                blocks++;
+            }
+        } while (ts_tree_cursor_goto_next_sibling(&cur));
+    }
+    if (blocks == 0) {
+        ts_tree_cursor_delete(&cur);
+        return NULL;
+    }
+    /* each block yields at most one run more than the sections it loses */
+    size_t runs = (size_t)blocks + (size_t)ix->count;
+    pod_module_t m = {.ctx = ctx};
+    m.buf = (char *)cbm_arena_alloc(ctx->arena, total + (runs * PAIR_LEN) + SKIP_ONE);
+    if (!m.buf) {
+        ts_tree_cursor_delete(&cur);
+        return NULL;
+    }
+    ts_tree_cursor_reset(&cur, ctx->root);
+    if (ts_tree_cursor_goto_first_child(&cur)) {
+        do {
+            TSNode ch = ts_tree_cursor_current_node(&cur);
+            if (strcmp(ts_node_type(ch), "pod") != 0) {
+                continue;
+            }
+            m.block = ch;
+            uint32_t pb = ts_node_start_byte(ch);
+            uint32_t pe = ts_node_end_byte(ch);
+            uint32_t at = pb;
+            /* the index holds the blocks' sections in document order */
+            for (; m.next_sec < ix->count && ix->items[m.next_sec].sb < pe; m.next_sec++) {
+                const pod_sec_t *s = &ix->items[m.next_sec];
+                if (!s->used || s->sb < pb) {
+                    continue;
+                }
+                if (s->sb > at) {
+                    pod_module_run(&m, at, s->sb);
+                }
+                at = s->eb > at ? s->eb : at;
+            }
+            pod_module_run(&m, at, pe);
+        } while (ts_tree_cursor_goto_next_sibling(&cur));
+    }
+    ts_tree_cursor_delete(&cur);
+    if (m.w == 0) {
+        return NULL;
+    }
+    m.buf[m.w] = '\0';
+    cbm_doclink_note_doc_line(ctx, m.buf, m.first_line);
+    return m.buf;
 }
 
 /* ── Doc entry points ── */
@@ -2641,11 +2826,19 @@ static const char *extract_docstring(CBMExtractCtx *ctx, TSNode node, const char
 }
 
 /* Doc of a Field, Variable, enum member or Macro (code languages only). */
-static const char *extract_member_docstring(CBMExtractCtx *ctx, TSNode node) {
+static const char *extract_member_docstring_status(CBMExtractCtx *ctx, TSNode node,
+                                                   bool *complete) {
     if (!doc_lang_member_docs(ctx->language)) {
+        if (complete) {
+            *complete = true;
+        }
         return NULL;
     }
-    return doc_for_anchor(ctx, doc_anchor(ctx, node));
+    return doc_for_anchor_status(ctx, doc_anchor(ctx, node), complete);
+}
+
+static const char *extract_member_docstring(CBMExtractCtx *ctx, TSNode node) {
+    return extract_member_docstring_status(ctx, node, NULL);
 }
 
 /* Go package comment: the comment group touching `package`, directives
@@ -6216,6 +6409,107 @@ void cbm_test_declarations_finish(CBMExtractCtx *ctx) {
     }
 }
 
+static bool make_name_char(char c) {
+    return c == '_' || c == '.' || c == '-' || (c >= '0' && c <= '9') ||
+           ((c | ' ') >= 'a' && (c | ' ') <= 'z');
+}
+
+/* A `rule` node that is a target-specific variable: after the targets'
+ * colon(s) come [export|override|private|unexport]... NAME and an
+ * assignment operator (= := ::= :::= += ?= !=). */
+static bool make_rule_sets_variable(TSNode rule, const char *src) {
+    static const char *const kws[] = {"export", "override", "private", "unexport", NULL};
+    TSNode targets = cbm_find_child_by_kind(rule, "targets");
+    if (ts_node_is_null(targets)) {
+        return false;
+    }
+    uint32_t p = ts_node_end_byte(targets);
+    uint32_t end = ts_node_end_byte(rule);
+    while (p < end && (src[p] == ' ' || src[p] == '\t')) {
+        p++;
+    }
+    if (p >= end || src[p] != ':') {
+        return false;
+    }
+    while (p < end && src[p] == ':') {
+        p++;
+    }
+    for (bool kw = true; kw;) {
+        while (p < end && (src[p] == ' ' || src[p] == '\t')) {
+            p++;
+        }
+        kw = false;
+        for (int i = 0; kws[i]; i++) {
+            size_t n = strlen(kws[i]);
+            if (p + n < end && strncmp(src + p, kws[i], n) == 0 &&
+                (src[p + n] == ' ' || src[p + n] == '\t')) {
+                p += (uint32_t)n;
+                kw = true;
+                break;
+            }
+        }
+    }
+    uint32_t name = p;
+    while (p < end && make_name_char(src[p])) {
+        p++;
+    }
+    if (p == name) {
+        return false;
+    }
+    while (p < end && (src[p] == ' ' || src[p] == '\t')) {
+        p++;
+    }
+    if (p < end && src[p] == ':') {
+        while (p < end && src[p] == ':') {
+            p++;
+        }
+        return p < end && src[p] == '=';
+    }
+    return p < end && (src[p] == '=' ||
+                       (strchr("+?!", src[p]) && p + SKIP_ONE < end && src[p + SKIP_ONE] == '='));
+}
+
+/* Make: a rule names several targets (`up down: deps`), each a goal
+ * `make <target>` runs. The rule's definition carries the first target;
+ * every further one gets a definition of its own over the same rule span --
+ * without fingerprint, structural profile or body tokens, so the copies of
+ * one recipe do not read as similar code. Special (`.X`) targets and
+ * repeats stay out. */
+static void push_make_rule_targets(CBMExtractCtx *ctx, TSNode node, const CBMDefinition *first) {
+    CBMArena *a = ctx->arena;
+    TSNode targets = cbm_find_child_by_kind(node, "targets");
+    uint32_t n = ts_node_is_null(targets) ? 0 : ts_node_named_child_count(targets);
+    for (uint32_t i = SKIP_ONE; i < n; i++) {
+        char *name =
+            cbm_func_name_node_text(a, ts_node_named_child(targets, i), ctx->source, ctx->language);
+        if (!name || !name[0] || name[0] == '.' || strcmp(name, first->name) == 0) {
+            continue;
+        }
+        bool repeat = false;
+        for (uint32_t j = SKIP_ONE; j < i && !repeat; j++) {
+            char *prev = cbm_func_name_node_text(a, ts_node_named_child(targets, j), ctx->source,
+                                                 ctx->language);
+            repeat = prev && strcmp(prev, name) == 0;
+        }
+        if (repeat) {
+            continue;
+        }
+        CBMDefinition d = *first;
+        d.name = name;
+        d.qualified_name =
+            cbm_fqn_compute_source_lang(a, ctx->project, ctx->rel_path, name, ctx->language);
+        d.is_exported = cbm_is_exported(name, ctx->language);
+        d.is_entry_point = strcmp(name, "main") == 0;
+        d.fingerprint = NULL;
+        d.fingerprint_k = 0;
+        d.structural_profile = NULL;
+        d.body_tokens = NULL;
+        if (d.qualified_name) {
+            cbm_defs_push(&ctx->result->defs, a, d);
+        }
+    }
+}
+
 static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec) {
     CBMArena *a = ctx->arena;
 
@@ -6247,6 +6541,12 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
     // emit a "..PHONY" segment (a "double dot") and thus a malformed QN. Skip
     // any dot-prefixed Make target.
     if (ctx->language == CBM_LANG_MAKEFILE && name[0] == '.') {
+        return;
+    }
+    // `targets: [export] VAR := value` sets a variable for those targets:
+    // no rule, so no def (else a target only ever configured there is a
+    // phantom, and a real rule of it gains the line as a variant).
+    if (ctx->language == CBM_LANG_MAKEFILE && make_rule_sets_variable(node, ctx->source)) {
         return;
     }
 
@@ -6309,14 +6609,6 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
      * proj.myapp.db.Func, not proj.myapp.db.conn.Func). Other langs unchanged. */
     def.qualified_name =
         cbm_fqn_compute_source_lang(a, ctx->project, ctx->rel_path, qn_name, ctx->language);
-    /* C-family platform variants (foo_win.c / foo_posix.c, src/unix/ vs
-     * src/win/): an external-linkage file-scope function takes its
-     * platform-neutral QN, so its variants are one definition. The call-scope
-     * twin in extract_unified.c applies the same rule. */
-    if (!ctx->enclosing_class_qn) {
-        def.qualified_name = cbm_platform_variant_qn(a, ctx->language, ctx->project, ctx->rel_path,
-                                                     qn_name, def.qualified_name, node);
-    }
     /* A free function declared inside a namespace (C++/C#/PHP) is qualified by
      * the namespace scope the def walk carries (enclosing_class_qn was extended
      * by is_namespace_scope_kind), so `ns::serialize` is `proj.file.ns.serialize`
@@ -6415,6 +6707,16 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
         }
     }
 
+    /* C-family platform variants (foo_win.c / foo_posix.c, src/unix/ vs
+     * src/win/): an external-linkage file-scope function keeps its path QN and
+     * carries its platform-neutral QN as the key that relates its variants
+     * (the node's `variant_key`). NULL for anything scoped, static, or in a
+     * path without a platform token. */
+    if (!ctx->enclosing_class_qn) {
+        def.variant_key = cbm_platform_neutral_qn(a, ctx->language, ctx->project, ctx->rel_path,
+                                                  qn_name, def.qualified_name, node);
+    }
+
     // Pony: fun/be/new (method/constructor/ffi_method) live in pony_func_types,
     // so the main def-walk extracts them here as "Function"; but one declared
     // inside a class/actor/struct/trait/interface/primitive IS a method. Detect
@@ -6498,6 +6800,9 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
             return;
     }
     cbm_defs_push(&ctx->result->defs, a, def);
+    if (ctx->language == CBM_LANG_MAKEFILE && strcmp(ts_node_type(node), "rule") == 0) {
+        push_make_rule_targets(ctx, node, &def);
+    }
 }
 
 // --- Class definition extraction ---
@@ -6647,10 +6952,22 @@ static bool is_markdown_heading_kind(const char *kind) {
  * with nested subsections as further `section` children that own their own
  * text. Stopping at either a `section` or another heading therefore gives each
  * Section exactly its OWN body under both that shape and a flat one. The bytes
- * between are contiguous in the source, so one slice beats concatenation. */
-static const char *extract_markdown_section_body(CBMArena *a, TSNode heading, const char *source) {
+ * between are contiguous in the source, so one slice beats concatenation.
+ *
+ * A top-level diagram fence (```mermaid, plantuml, dot, d2 ...) is the one
+ * exception: the body keeps the labels its diagram parser reads, not the
+ * format's syntax. Arrows and keywords (`-->`, `participant`, `classDiagram`)
+ * name no code and crowd the prose out of the 500-byte cap, while the labels
+ * are what name the code. Judged on held-out sections that embed diagrams,
+ * labels gave more sections a correct code candidate (56 vs 42 of 147) at a
+ * higher precision (0.54 vs 0.45) than the fence as written; dropping the
+ * fence lost candidates (29). The diagram itself keeps its own nodes. */
+static const char *extract_markdown_section_body(CBMExtractCtx *ctx, TSNode heading) {
+    CBMArena *a = ctx->arena;
+    const char *source = ctx->source;
     uint32_t start = ts_node_end_byte(heading);
     uint32_t end = start;
+    int fences = 0;
     for (TSNode sib = ts_node_next_sibling(heading); !ts_node_is_null(sib);
          sib = ts_node_next_sibling(sib)) {
         const char *sk = ts_node_type(sib);
@@ -6658,11 +6975,57 @@ static const char *extract_markdown_section_body(CBMArena *a, TSNode heading, co
             break;
         }
         end = ts_node_end_byte(sib);
+        fences += cbm_diagram_fence_is_diagram(source, sib);
     }
     if (end <= start) {
         return NULL;
     }
-    return collapse_prose(a, source + start, (size_t)(end - start));
+    if (fences == 0) {
+        return collapse_prose(a, source + start, (size_t)(end - start));
+    }
+    /* The body with each diagram fence replaced by its labels. */
+    const char **labels = (const char **)cbm_arena_alloc(a, (size_t)fences * sizeof(char *));
+    if (!labels) {
+        return NULL;
+    }
+    size_t total = 0;
+    int k = 0;
+    for (TSNode sib = ts_node_next_sibling(heading); !ts_node_is_null(sib) && k < fences;
+         sib = ts_node_next_sibling(sib)) {
+        if (cbm_diagram_fence_is_diagram(source, sib)) {
+            labels[k] = cbm_diagram_fence_labels(ctx, sib);
+            total += labels[k] ? strlen(labels[k]) + SKIP_ONE : 0;
+            k++;
+        }
+    }
+    char *buf = (char *)cbm_arena_alloc(a, (size_t)(end - start) + total + SKIP_ONE);
+    if (!buf) {
+        return NULL;
+    }
+    size_t w = 0;
+    uint32_t prev = start;
+    k = 0;
+    for (TSNode sib = ts_node_next_sibling(heading); !ts_node_is_null(sib) && k < fences;
+         sib = ts_node_next_sibling(sib)) {
+        if (!cbm_diagram_fence_is_diagram(source, sib)) {
+            continue;
+        }
+        uint32_t sb = ts_node_start_byte(sib);
+        memcpy(buf + w, source + prev, sb - prev);
+        w += sb - prev;
+        if (labels[k]) {
+            size_t n = strlen(labels[k]);
+            memcpy(buf + w, labels[k], n);
+            w += n;
+            buf[w++] = ' ';
+        }
+        k++;
+        prev = ts_node_end_byte(sib);
+    }
+    memcpy(buf + w, source + prev, end - prev);
+    w += end - prev;
+    buf[w] = '\0';
+    return collapse_prose(a, buf, w);
 }
 
 /* Push a config-language definition that carries prose. push_simple_class_def
@@ -6803,6 +7166,19 @@ static char *find_ini_section_name(CBMArena *a, TSNode node, const char *source)
     return NULL;
 }
 
+// HCL: a top-level block (resource, data, module, variable, output, locals,
+// provider, terraform; Terragrunt's include, dependency, ...) sits directly in
+// the file's body. Blocks nested in one (lifecycle, dynamic, content, a
+// resource's own argument blocks) are part of it, not entities of their own.
+static bool hcl_block_is_top_level(TSNode node) {
+    TSNode body = ts_node_parent(node);
+    if (ts_node_is_null(body) || strcmp(ts_node_type(body), "body") != 0) {
+        return false;
+    }
+    TSNode file = ts_node_parent(body);
+    return !ts_node_is_null(file) && strcmp(ts_node_type(file), "config_file") == 0;
+}
+
 // HCL: extract block name from identifier child.
 static char *find_hcl_block_name(CBMArena *a, TSNode node, const char *source) {
     TSNode id = cbm_find_child_by_kind(node, "identifier");
@@ -6862,9 +7238,9 @@ static bool extract_config_class_def(CBMExtractCtx *ctx, TSNode node, const char
         // "Class"; that assertion is the inaccurate side and is flagged for review.
         label = "Section";
         // #518: index what the section SAYS, not just its title.
-        docstring = extract_markdown_section_body(a, node, ctx->source);
+        docstring = extract_markdown_section_body(ctx, node);
     } else if (ctx->language == CBM_LANG_HCL && strcmp(kind, "block") == 0) {
-        name = find_hcl_block_name(a, node, ctx->source);
+        name = hcl_block_is_top_level(node) ? find_hcl_block_name(a, node, ctx->source) : NULL;
     } else {
         return false;
     }
@@ -7563,13 +7939,16 @@ static void emit_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *s
     }
 
     // Extract methods inside the class
+    int methods_from = ctx->result->defs.count;
     extract_class_methods(ctx, node, class_qn, spec);
 
     // Extract typed struct/class fields (for cross-file LSP type resolution)
+    int fields_from = ctx->result->defs.count;
     extract_class_fields(ctx, node, class_qn, spec);
+    fence_fields_named_like_methods(ctx, methods_from, fields_from);
 
-    // Extract class-level variables (field declarations)
-    extract_class_variables(ctx, node, class_qn, spec);
+    // Extract class-level variables (field declarations not already Fields)
+    extract_class_variables(ctx, node, class_qn, spec, fields_from);
 
     if (ctx->language == CBM_LANG_PYTHON) {
         extract_py_field_types(ctx, node, class_qn);
@@ -8523,8 +8902,8 @@ static void extract_elixir_call(CBMExtractCtx *ctx, TSNode node, const CBMLangSp
  * from `name` only where a language scopes a variable below the module — Nix,
  * whose binding names are attrpaths (`a.b.c = …` is name `c`, QN suffix `a.b.c`).
  * Pass NULL to use `name` for both. */
-static void push_var_def_qn(CBMExtractCtx *ctx, const char *name, const char *qn_name,
-                            TSNode node) {
+static void push_var_def_qn_doc(CBMExtractCtx *ctx, const char *name, const char *qn_name,
+                                TSNode node, const char *doc) {
     if (!name || !name[0] || strcmp(name, "_") == 0) {
         return;
     }
@@ -8546,8 +8925,16 @@ static void push_var_def_qn(CBMExtractCtx *ctx, const char *name, const char *qn
     def.start_line = ts_node_start_point(node).row + TS_LINE_OFFSET;
     def.end_line = ts_node_end_point(node).row + TS_LINE_OFFSET;
     def.is_exported = cbm_is_exported(name, ctx->language);
-    def.docstring = extract_member_docstring(ctx, node);
+    def.docstring = doc;
     cbm_defs_push(&ctx->result->defs, a, def);
+}
+
+static void push_var_def_qn(CBMExtractCtx *ctx, const char *name, const char *qn_name,
+                            TSNode node) {
+    if (!name || !name[0] || strcmp(name, "_") == 0) {
+        return;
+    }
+    push_var_def_qn_doc(ctx, name, qn_name, node, extract_member_docstring(ctx, node));
 }
 
 static void push_var_def(CBMExtractCtx *ctx, const char *name, TSNode node) {
@@ -8619,6 +9006,17 @@ static void extract_csharp_vars(CBMExtractCtx *ctx, TSNode node, CBMArena *a) {
         push_var_def(ctx, fname, node);
         return;
     }
+    /* All declarators have this field as their documentation anchor. Keep one
+     * immutable arena string, while each variable retains its own identity:
+     * the doc-link driver takes the references of that one text once, from
+     * the first declarator. A text that could not be collected whole is no
+     * doc of any of them (doc_lost has marked the file's doc links failed);
+     * it is not looked up again per declarator. */
+    bool complete = false;
+    const char *doc = extract_member_docstring_status(ctx, node, &complete);
+    if (!complete) {
+        doc = NULL;
+    }
     uint32_t n = ts_node_named_child_count(node);
     for (uint32_t i = 0; i < n; i++) {
         TSNode child = ts_node_named_child(node, i);
@@ -8634,7 +9032,8 @@ static void extract_csharp_vars(CBMExtractCtx *ctx, TSNode node, CBMArena *a) {
                     id = cbm_find_child_by_kind(decl, "identifier");
                 }
                 if (!ts_node_is_null(id)) {
-                    push_var_def(ctx, cbm_node_text(a, id, ctx->source), decl);
+                    const char *name = cbm_node_text(a, id, ctx->source);
+                    push_var_def_qn_doc(ctx, name, NULL, decl, doc);
                 }
             }
         }
@@ -9879,6 +10278,31 @@ static void extract_yaml_toplevel_keys(CBMExtractCtx *ctx, TSNode root) {
     }
 }
 
+// True when the YAML document's top level holds both `apiVersion` and `kind`:
+// a Kubernetes object, whose top-level keys are its envelope.
+static bool yaml_is_k8s_object(CBMExtractCtx *ctx, TSNode root) {
+    TSNode bm = find_yaml_toplevel_mapping(root);
+    if (ts_node_is_null(bm)) {
+        return false;
+    }
+    bool api_version = false;
+    bool kind = false;
+    uint32_t n = ts_node_named_child_count(bm);
+    for (uint32_t i = 0; i < n && !(api_version && kind); i++) {
+        TSNode pair = ts_node_named_child(bm, i);
+        if (strcmp(ts_node_type(pair), "block_mapping_pair") != 0) {
+            continue;
+        }
+        TSNode key = ts_node_child_by_field_name(pair, TS_FIELD("key"));
+        const char *k = ts_node_is_null(key) ? NULL : cbm_node_text(ctx->arena, key, ctx->source);
+        if (k) {
+            api_version = api_version || strcmp(k, "apiVersion") == 0;
+            kind = kind || strcmp(k, "kind") == 0;
+        }
+    }
+    return api_version && kind;
+}
+
 static void extract_variables(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec) {
     if (!spec->variable_node_types || !spec->variable_node_types[0]) {
         return;
@@ -9890,10 +10314,37 @@ static void extract_variables(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec
         return;
     }
 
+    // A Kubernetes object's top-level keys (apiVersion, kind, metadata, spec,
+    // status) are its envelope, which its Resource node carries; as Variables
+    // they repeated in every manifest and fed name-similarity config links.
+    if (ctx->language == CBM_LANG_YAML && yaml_is_k8s_object(ctx, root)) {
+        return;
+    }
+
     // Config languages with nested structure: use recursive walk
     if (ctx->language == CBM_LANG_YAML || ctx->language == CBM_LANG_TOML ||
         ctx->language == CBM_LANG_INI || ctx->language == CBM_LANG_JSON) {
         walk_variables_iter(ctx, root, spec);
+        return;
+    }
+
+    /* HCL: a file's own assignments -- a .tfvars file, Terragrunt's `inputs`
+     * -- sit in the top-level body, one level below the root the generic loop
+     * scans, so none was extracted. Attributes inside blocks belong to their
+     * block. */
+    if (ctx->language == CBM_LANG_HCL) {
+        TSNode body = cbm_find_child_by_kind(root, "body");
+        uint32_t n = ts_node_is_null(body) ? 0 : ts_node_named_child_count(body);
+        for (uint32_t i = 0; i < n; i++) {
+            TSNode attr = ts_node_named_child(body, i);
+            if (strcmp(ts_node_type(attr), "attribute") != 0) {
+                continue;
+            }
+            TSNode id = cbm_find_child_by_kind(attr, "identifier");
+            if (!ts_node_is_null(id)) {
+                push_var_def(ctx, cbm_node_text(ctx->arena, id, ctx->source), attr);
+            }
+        }
         return;
     }
 
@@ -10185,6 +10636,15 @@ static TSNode resolve_field_name_node(TSNode child) {
         return null_node;
     }
     const char *nk = ts_node_type(name_node);
+    /* Java `private static final String PROP = "v";`: the declarator holds the
+     * initializer too, so its text named the Field `PROP = "v"`; its name is
+     * the declarator's own name field */
+    if (strcmp(nk, "variable_declarator") == 0) {
+        TSNode inner = ts_node_child_by_field_name(name_node, TS_FIELD("name"));
+        if (!ts_node_is_null(inner)) {
+            return inner;
+        }
+    }
     if (strcmp(nk, "pointer_declarator") == 0 || strcmp(nk, "array_declarator") == 0) {
         TSNode inner = ts_node_child_by_field_name(name_node, TS_FIELD("declarator"));
         if (!ts_node_is_null(inner)) {
@@ -10583,9 +11043,59 @@ static void extract_class_fields(CBMExtractCtx *ctx, TSNode class_node, const ch
     member_iter_done(&it);
 }
 
-// Extract class-level variables (field declarations inside class bodies)
+static int cmp_cstr_ptr(const void *pa, const void *pb) {
+    return strcmp(*(const char *const *)pa, *(const char *const *)pb);
+}
+
+// A field and a method of one class body may share a name (Java `count` and
+// `count()`), and the graph keeps one node per qualified name, so one of them
+// was lost. The field then takes the qualified name `<Owner>.<name>#field`
+// (the `base#suffix` fence of `#macro` and the Rust cfg twins; the registry
+// still files it under its plain name). Only a collision in the same body
+// renames, so every other field keeps its name. The body's methods are the
+// defs [methods_from, fields_from), its fields [fields_from, count); a sorted
+// copy of the method names keeps a large class linear-logarithmic.
+static void fence_fields_named_like_methods(CBMExtractCtx *ctx, int methods_from, int fields_from) {
+    CBMDefinition *defs = ctx->result->defs.items;
+    int fields_to = ctx->result->defs.count;
+    if (fields_from >= fields_to || methods_from >= fields_from) {
+        return;
+    }
+    const char **qns = (const char **)cbm_arena_alloc(
+        ctx->arena, (size_t)(fields_from - methods_from) * sizeof(const char *));
+    if (!qns) {
+        return;
+    }
+    size_t n = 0;
+    for (int i = methods_from; i < fields_from; i++) {
+        if (defs[i].qualified_name && strcmp(defs[i].label, "Method") == 0) {
+            qns[n++] = defs[i].qualified_name;
+        }
+    }
+    if (n == 0) {
+        return;
+    }
+    qsort(qns, n, sizeof(qns[0]), cmp_cstr_ptr);
+    for (int i = fields_from; i < fields_to; i++) {
+        const char *qn = defs[i].qualified_name;
+        if (qn && strcmp(defs[i].label, "Field") == 0 &&
+            bsearch(&qn, qns, n, sizeof(qns[0]), cmp_cstr_ptr)) {
+            char *fenced = cbm_arena_sprintf(ctx->arena, "%s#field", qn);
+            if (fenced) {
+                defs[i].qualified_name = fenced;
+            }
+        }
+    }
+}
+
+// Extract class-level variables (field declarations inside class bodies).
+// A declaration that extract_class_fields already made a Field (the defs from
+// `fields_from` on) is not minted again: Java, C# and Solidity list the same
+// kind as field and variable, and the second copy was a Variable with the
+// module's qualified name (`demo.query.filters` for field Query.filters),
+// which collided with package paths.
 static void extract_class_variables(CBMExtractCtx *ctx, TSNode class_node, const char *class_qn,
-                                    const CBMLangSpec *spec) {
+                                    const CBMLangSpec *spec, int fields_from) {
     if (!spec->variable_node_types || !spec->variable_node_types[0]) {
         return;
     }
@@ -10595,6 +11105,10 @@ static void extract_class_variables(CBMExtractCtx *ctx, TSNode class_node, const
         return;
     }
 
+    /* the Fields of this body, in body order: walked alongside the children */
+    int fields_to = ctx->result->defs.count;
+    int fi = fields_from;
+
     /* Record the declaring class on every variable minted from this body (see
      * push_var_def_qn); saved/restored so module-level minting stays bare. */
     const char *saved_parent = ctx->var_parent_class;
@@ -10603,9 +11117,19 @@ static void extract_class_variables(CBMExtractCtx *ctx, TSNode class_node, const
     member_iter_init(&it, body, ctx->language, true);
     TSNode child;
     while (member_iter_next(&it, &child)) {
-        if (cbm_kind_in_set(child, spec->variable_node_types)) {
-            extract_var_names(ctx, child, spec);
+        if (!cbm_kind_in_set(child, spec->variable_node_types)) {
+            continue;
         }
+        int line = (int)ts_node_start_point(child).row + TS_LINE_OFFSET;
+        while (fi < fields_to && (strcmp(ctx->result->defs.items[fi].label, "Field") != 0 ||
+                                  (int)ctx->result->defs.items[fi].start_line < line)) {
+            fi++;
+        }
+        if (fi < fields_to && (int)ctx->result->defs.items[fi].start_line == line &&
+            spec->field_node_types && cbm_kind_in_set(child, spec->field_node_types)) {
+            continue; /* already a Field of this class */
+        }
+        extract_var_names(ctx, child, spec);
     }
     member_iter_done(&it);
     ctx->var_parent_class = saved_parent;
@@ -11910,6 +12434,10 @@ void cbm_extract_definitions(CBMExtractCtx *ctx) {
     ctx->result->module_doc = extract_module_doc(ctx);
 
     cbm_extract_definitions_without_module(ctx);
+    if (ctx->language == CBM_LANG_PERL) {
+        /* after the subs: the POD sections they hold are not the module's */
+        ctx->result->module_doc = doc_perl_module(ctx);
+    }
 
     if (ctx->language == CBM_LANG_JAVASCRIPT || ctx->language == CBM_LANG_TYPESCRIPT ||
         ctx->language == CBM_LANG_TSX || ctx->language == CBM_LANG_ARKTS) {

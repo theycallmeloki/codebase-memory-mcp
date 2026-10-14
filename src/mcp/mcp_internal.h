@@ -13,6 +13,11 @@
 typedef bool (*cbm_mcp_quarantine_test_hook_fn)(void *context, const char *step);
 typedef bool (*cbm_mcp_command_test_hook_fn)(void *context, const char *command);
 #ifdef CBM_ENABLE_TEST_SEAMS
+/* One-shot sample JSON string-copy allocation failure, not a backing-pool
+ * growth event: 0 is next, 4 is fifth, -1 disables. Setting clears consumption. */
+void cbm_mcp_doc_links_test_fail_sample_alloc_after(int successful_copies);
+bool cbm_mcp_doc_links_test_sample_alloc_failed(void);
+
 typedef void (*cbm_mcp_auto_index_count_test_hook_fn)(void *context);
 #endif
 
@@ -48,6 +53,12 @@ bool cbm_mcp_jsonrpc_response_prepend_notice(char **response_io, const char *not
  * must remove any untrusted field with the same name before invoking this. */
 bool cbm_mcp_index_policy_add_to_args(yyjson_mut_doc *doc, yyjson_mut_val *root,
                                       const cbm_index_resource_policy_t *policy);
+
+/* Encode a doc_candidates setting the user set to a boolean on an internal
+ * worker request (the worker reads no config). Unset or unparseable adds no
+ * key, so the worker's index mode decides. False only when encoding fails. */
+bool cbm_mcp_index_doc_candidates_add_to_args(yyjson_mut_doc *doc, yyjson_mut_val *root,
+                                              struct cbm_config *config);
 
 enum { CBM_MCP_DEFAULT_AUTO_INDEX_LIMIT = 50000 };
 
