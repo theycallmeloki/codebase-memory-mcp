@@ -16949,8 +16949,8 @@ TEST(cli_print_tool_help_issue680) {
     ASSERT_NOT_NULL(strstr(out, "--format <tree|json> [default: tree]"));
     ASSERT_NOT_NULL(strstr(out, "--detail <ids|default> [default: default]"));
     ASSERT_EQ(cli_tool_help_capture("index_repository", out, sizeof(out)), 0);
-    ASSERT_NOT_NULL(strstr(out, "--mode <full|moderate|fast|cross-repo-intelligence> [default: "
-                                "full]"));
+    ASSERT_NOT_NULL(strstr(out, "--mode <full|moderate|fast|cross-repo-intelligence|contract-link> "
+                                "[default: full]"));
     ASSERT_EQ(cli_tool_help_capture("nope_not_a_tool", out, sizeof(out)), -1);
     ASSERT_STR_EQ(out, "");
     PASS();
