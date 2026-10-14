@@ -17886,16 +17886,25 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
     cbm_changed_hunk_t *hunks = NULL;
     int hunk_count = 0;
     if (!seed_rows.failed && (want_symbols || seed_req.list)) {
+        /* The hunks are read back by cbm_parse_hunks, which keys on the literal
+         * "+++ b/<path>" header. Pin the diff output the same way test_impact
+         * does (same macros, same reason): a user's diff.mnemonicPrefix emits
+         * "+++ w/<path>" instead, the header never matches, and every changed
+         * file silently falls back to whole-file seeding. */
         char hunk_cmd[CBM_SZ_2K];
 #ifdef _WIN32
         snprintf(hunk_cmd, sizeof(hunk_cmd),
-                 "git -C \"%s\" diff --relative --unified=0 \"%s\" \"%s\" -- 2>NUL && "
-                 "git -C \"%s\" diff --relative --unified=0 -- 2>NUL",
+                 "git -C \"%s\" " CBM_TEST_IMPACT_GIT_PINS " diff " CBM_TEST_IMPACT_DIFF_FLAGS
+                 " --relative \"%s\" \"%s\" -- 2>NUL && "
+                 "git -C \"%s\" " CBM_TEST_IMPACT_GIT_PINS " diff " CBM_TEST_IMPACT_DIFF_FLAGS
+                 " --relative -- 2>NUL",
                  root_path, merge_base, head_oid, root_path);
 #else
         snprintf(hunk_cmd, sizeof(hunk_cmd),
-                 "git -C '%s' diff --relative --unified=0 '%s' '%s' -- 2>/dev/null && "
-                 "git -C '%s' diff --relative --unified=0 -- 2>/dev/null",
+                 "git -C '%s' " CBM_TEST_IMPACT_GIT_PINS " diff " CBM_TEST_IMPACT_DIFF_FLAGS
+                 " --relative '%s' '%s' -- 2>/dev/null && "
+                 "git -C '%s' " CBM_TEST_IMPACT_GIT_PINS " diff " CBM_TEST_IMPACT_DIFF_FLAGS
+                 " --relative -- 2>/dev/null",
                  root_path, merge_base, head_oid, root_path);
 #endif
         char hunk_output_path[CBM_SZ_2K] = {0};

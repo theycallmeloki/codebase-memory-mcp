@@ -15547,6 +15547,107 @@ TEST(tool_detect_changes_subdirectory_project_translates_git_root_paths_issue195
     PASS();
 }
 
+/* A user's `diff.mnemonicPrefix` makes git write "+++ w/<path>" instead of the
+ * "+++ b/<path>" that cbm_parse_hunks keys on. Left unpinned, the hunk diff
+ * parses zero hunks, every changed file falls back to whole-file seeding, and a
+ * one-line edit inside the first definition also seeds the untouched second
+ * one. The trigger lives in repository-local config because the diff runs under
+ * whatever global config the real environment has. */
+TEST(tool_detect_changes_hunk_scoping_survives_mnemonic_prefix_config) {
+    char repo[CBM_SZ_4K];
+    snprintf(repo, sizeof(repo), "%s/cbm-detect-mnemonic-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(repo));
+    char cache[CBM_SZ_4K];
+    snprintf(cache, sizeof(cache), "%s/cbm-detect-mnemonic-cache-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+
+    char source_dir[CBM_SZ_4K];
+    snprintf(source_dir, sizeof(source_dir), "%s/src", repo);
+    ASSERT_EQ(cbm_mkdir(source_dir), 0);
+    char math_source[CBM_SZ_4K];
+    snprintf(math_source, sizeof(math_source), "%s/math.c", source_dir);
+    ASSERT_EQ(th_write_file(math_source, "int add_one(int x) { return x + 1; }\n"
+                                         "int untouched(void) { return 0; }\n"),
+              0);
+
+    const char *const init_args[] = {"init", "-q", NULL};
+    const char *const add_args[] = {"add", "-A", NULL};
+    const char *const commit_args[] = {
+        "-c",     "user.name=cbm-test",
+        "-c",     "user.email=cbm-test@example.invalid",
+        "-c",     "commit.gpgsign=false",
+        "commit", "-q",
+        "-m",     "fixture",
+        NULL,
+    };
+    ASSERT_EQ(mcp_test_git(repo, init_args), 0);
+    ASSERT_EQ(mcp_test_git(repo, add_args), 0);
+    ASSERT_EQ(mcp_test_git(repo, commit_args), 0);
+    /* Repository-local, so it survives the environment mcp_test_git restores. */
+    const char *const mnemonic_args[] = {"config", "diff.mnemonicPrefix", "true", NULL};
+    ASSERT_EQ(mcp_test_git(repo, mnemonic_args), 0);
+
+    /* The edit touches the first definition only. */
+    ASSERT_EQ(th_write_file(math_source, "int add_one(int x) { return x + 2; }\n"
+                                         "int untouched(void) { return 0; }\n"),
+              0);
+
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    ASSERT_EQ(cbm_setenv("CBM_CACHE_DIR", cache, 1), 0);
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    const char *project = "detect-mnemonic-project";
+    ASSERT_EQ(cbm_store_upsert_project(store, project, repo), CBM_STORE_OK);
+    cbm_mcp_server_set_project(srv, project);
+
+    cbm_node_t seed = {.project = project,
+                       .label = "Function",
+                       .name = "add_one",
+                       .qualified_name = "fixture.src.math.add_one",
+                       .file_path = "src/math.c",
+                       .start_line = 1,
+                       .end_line = 1};
+    ASSERT_GT(cbm_store_upsert_node(store, &seed), 0);
+    cbm_node_t untouched = {.project = project,
+                            .label = "Function",
+                            .name = "untouched",
+                            .qualified_name = "fixture.src.math.untouched",
+                            .file_path = "src/math.c",
+                            .start_line = 2,
+                            .end_line = 2};
+    ASSERT_GT(cbm_store_upsert_node(store, &untouched), 0);
+
+    char *response =
+        cbm_mcp_handle_tool(srv, "detect_changes",
+                            "{\"project\":\"detect-mnemonic-project\",\"base_branch\":\"HEAD\","
+                            "\"scope\":\"impact\",\"depth\":2,\"max_output_tokens\":10000,"
+                            "\"format\":\"json\"}");
+    char *inner = extract_text_content(response);
+    yyjson_doc *doc = inner ? yyjson_read(inner, strlen(inner), 0) : NULL;
+    yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
+    bool seed_scoped = root && yyjson_get_int(yyjson_obj_get(root, "seed_symbols")) == 1;
+    if (!seed_scoped) {
+        fprintf(stderr, "  mnemonic-prefix response: %s\n", inner ? inner : "(null)");
+    }
+
+    yyjson_doc_free(doc);
+    free(inner);
+    free(response);
+    cbm_mcp_server_free(srv);
+    restore_cache_dir(saved_cache_copy);
+    free(saved_cache_copy);
+    ASSERT_EQ(th_rmtree(cache), 0);
+    ASSERT_EQ(th_rmtree(repo), 0);
+
+    /* A whole-file fallback counts both definitions, so 2 means the scoping
+     * path never saw a usable diff. Only the edited definition may be seeded. */
+    ASSERT_TRUE(seed_scoped);
+    PASS();
+}
+
 TEST(tool_detect_changes_escapes_newline_path_in_tree_and_round_trips_json) {
 #ifdef _WIN32
     /* Win32 rejects control characters in filenames, so Windows cannot create
@@ -23897,6 +23998,7 @@ SUITE(mcp) {
     RUN_TEST(tool_detect_changes_preserves_utf8_git_path_and_impact_seed);
     RUN_TEST(tool_detect_changes_finds_nested_untracked_file_and_impact_seed);
     RUN_TEST(tool_detect_changes_subdirectory_project_translates_git_root_paths_issue1951);
+    RUN_TEST(tool_detect_changes_hunk_scoping_survives_mnemonic_prefix_config);
     RUN_TEST(tool_detect_changes_escapes_newline_path_in_tree_and_round_trips_json);
     RUN_TEST(tool_detect_changes_staged_rename_uses_exact_destination_record);
     RUN_TEST(tool_detect_changes_contained_commands_clean_up_error_and_success);
