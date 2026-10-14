@@ -49,6 +49,22 @@
  *                         A run that would exceed it spends NOTHING and logs
  *                         llm_enrich.skip with the projection and the remedy,
  *                         rather than enriching a prefix. 0 removes the ceiling.
+ *     CBM_LLM_CONCURRENCY model calls in flight at once, default 8. The stage
+ *                         that talks to the model runs in a worker pool; the
+ *                         stage that writes prose into the graph stays on the
+ *                         main thread, so no graph-buffer lock is involved.
+ *                         Set 1 for the strictly serial path. This is a
+ *                         throughput knob, not a spend knob: the same number of
+ *                         calls is made either way.
+ *     CBM_LLM_NO_THINKING 1 => send chat_template_kwargs {"enable_thinking":
+ *                         false} on every request, for a thinking model served
+ *                         by llama.cpp/Ollama/vLLM. Summarising a file needs no
+ *                         reasoning trace, and the trace costs full-price
+ *                         output tokens: measured on Ternary-Bonsai-2-27B, the
+ *                         same 5,443-token prompt took 820 completion tokens
+ *                         and 37.7s with thinking on, 325 and 11.4s with it
+ *                         off. Default 0, because the field is not part of the
+ *                         OpenAI schema and a hosted backend may reject it.
  *     CBM_LLM_DRY_RUN     1 => report how many files would be enriched and how
  *                         many bytes that could put on the wire, then make no
  *                         calls at all. For sizing a repository up front.
@@ -59,8 +75,12 @@
  *
  * COST. One call per file, and only on files the run actually visits — the
  * closure-delta route stages only changed files. A content-addressed on-disk
- * cache keyed by (model + path + content) makes a re-index of unchanged content
- * free, so a full rebuild does not re-bill.
+ * cache keyed by (model + prompt + path + content) makes a re-index of unchanged
+ * content free, so a full rebuild does not re-bill. The PROMPT is part of that
+ * key, not just the content: without it a prompt edit would silently reuse
+ * answers the previous prompt produced, and since those answers still parse the
+ * regression would be invisible. Editing the prompt therefore re-bills the
+ * corpus once, which is the correct trade.
  */
 #include "foundation/compat.h" /* cbm_fileno */
 #include "foundation/constants.h"
@@ -72,24 +92,70 @@
 #include "foundation/subprocess.h"
 #include "pipeline/pipeline.h"
 #include "pipeline/pipeline_internal.h"
+#include "pipeline/llm_client.h"
+#include "pipeline/worker_pool.h"
 #include "graph_buffer/graph_buffer.h"
 
 #include "yyjson/yyjson.h"
 
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h> /* fchmod: the curl config carrying the bearer token is 0600 */
 
-/* Property keys. Prefixed so they cannot collide with the structural keys the
- * extractor writes ("extension", "last_modified", "complexity", ...). */
-static const char *const ENRICH_KEYS[] = {"llm_purpose", "llm_summary", "llm_business_context"};
+/* The fields the model returns, paired with the property keys they are stored
+ * under. Property keys are prefixed so they cannot collide with the structural
+ * keys the extractor writes ("extension", "last_modified", "complexity", ...).
+ * One table, so a new field cannot be added to one list and forgotten in the
+ * other: the parser reads .response_key and the merge writes .property_key, and
+ * both iterate this array. Previously the response names lived in a second array
+ * inside the parser and had to be kept in step by hand. */
+typedef struct {
+    const char *response_key; /* key in the model's JSON reply */
+    const char *property_key; /* key written into the node's properties_json */
+} enrich_field_t;
+
+static const enrich_field_t ENRICH_FIELDS[] = {
+    {"purpose", "llm_purpose"},
+    {"summary", "llm_summary"},
+    {"business_context", "llm_business_context"},
+    {"contract", "llm_contract"},
+};
 enum {
     ENRICH_KEY_PURPOSE = 0,
-    ENRICH_FIELD_COUNT = 3,
+    ENRICH_FIELD_COUNT = (int)(sizeof(ENRICH_FIELDS) / sizeof(ENRICH_FIELDS[0])),
     ENRICH_VALUE_CAP = 768, /* per field, as written into properties */
-    ENRICH_RESPONSE_CAP = 4 * 1024 * 1024,
 };
+
+/* The whole system prompt, in one place. It is part of the cache key (see
+ * enrich_cache_path), so editing it invalidates every cached answer by
+ * construction: the key materially cannot outlive the prompt that produced it.
+ * A hand-maintained version number would be forgotten the first time someone
+ * tweaks a sentence, and the failure is silent — the old answers still parse,
+ * so a prompt change would quietly keep returning the previous prompt's
+ * results. Hashing the text removes that whole class of mistake.
+ *
+ * The "contract" key is the cross-repository hook, and its wording is load
+ * bearing. A prompt that asks only "what is this file for?" gets package-local
+ * answers: on a four-repo sample it named a data-derived key in ZERO files, so
+ * nothing could be linked. Asking for the DATA INVARIANT, in repository-neutral
+ * terms and explicitly ignoring local identifiers, named one in ALL FOUR
+ * ("the per-element identifier ... derived, never supplied by position" rather
+ * than "Defines the entity adapter factory"). Measured, not assumed. */
+static const char *const ENRICH_SYSTEM_PROMPT =
+    "You analyse one source file at a time for a code-search index. Reply with a single JSON "
+    "object and nothing else, with exactly these keys: "
+    "\"purpose\" (one sentence: what this file is for), "
+    "\"summary\" (one short paragraph: what it does and how it fits the wider codebase), "
+    "\"business_context\" (one sentence: which part of the product or workflow it serves), "
+    "\"contract\" (one sentence: the DATA INVARIANT this code is responsible for keeping true - "
+    "what must hold about the data flowing through it such that violating it would be a bug. "
+    "State it in repository-neutral terms and ignore local identifiers and package names; if "
+    "another codebase implemented the same concept under a different name, your sentence must "
+    "still apply to it). "
+    "Describe only what the file actually shows. Never invent behaviour, callers or intent "
+    "that is not visible in the content.";
 
 /* ── configuration ──────────────────────────────────────────────────────── */
 
@@ -101,7 +167,9 @@ typedef struct {
     char model[128];
     int timeout_ms;
     long max_bytes;
-    long max_files; /* ceiling on files attempted in one run; 0 => none */
+    long max_files;   /* ceiling on files attempted in one run; 0 => none */
+    int concurrency;  /* model calls in flight at once; 1 => strictly serial */
+    bool no_thinking; /* ask the server to skip its reasoning trace */
 } enrich_cfg_t;
 
 /* cbm_safe_getenv returns either the caller's buffer or the fallback, so the
@@ -136,6 +204,33 @@ static void enrich_cfg_load(enrich_cfg_t *c) {
     long maxf = atol(num);
     c->max_files = maxf > 0 ? maxf : 0;
 
+    /* THROUGHPUT. One model call per file, each dominated by a network round
+     * trip (or, against a local llama.cpp, by decode). Serially that leaves a
+     * 4-slot server idle between requests: measured against Ternary-Bonsai-2-
+     * 27B on one RTX 3090, 8 files took 50.8s in flight but 8 x 8.9s = 71s one
+     * at a time, and a 2,993-file repository is the difference between 40
+     * minutes and 5.3 hours.
+     *
+     * Defaults to 8 rather than to core count: the ceiling that matters is
+     * usually the server's own slot count, not the local CPU, and every worker
+     * here is blocked on I/O. Set 1 to restore the strictly serial path. */
+    enrich_env("CBM_LLM_CONCURRENCY", "8", num, sizeof(num));
+    int conc = atoi(num);
+    c->concurrency = conc > 0 ? conc : 1;
+
+    /* REASONING TRACE. A thinking model spends output tokens on a chain of
+     * thought before the answer, and those tokens are generated and billed one
+     * at a time like any other. Summarising a file needs no reasoning trace.
+     * Measured against Ternary-Bonsai-2-27B on a 5,443-token prompt: 820
+     * completion tokens and 37.7s with thinking on; 325 tokens and 11.4s with
+     * it off. Same model, same file, 3.3x.
+     *
+     * OFF BY DEFAULT. `chat_template_kwargs` is a llama.cpp/Ollama extension,
+     * not part of the OpenAI schema, and a hosted backend may reject a body it
+     * does not recognise. It is opt-in so the default request stays portable. */
+    enrich_env("CBM_LLM_NO_THINKING", "0", num, sizeof(num));
+    c->no_thinking = num[0] == '1';
+
     /* Report what the pass WOULD spend, then stop, so a large repository can
      * be sized before committing to the call volume. */
     enrich_env("CBM_LLM_DRY_RUN", "0", num, sizeof(num));
@@ -148,98 +243,10 @@ static void enrich_cfg_load(enrich_cfg_t *c) {
 
 /* ── helpers ────────────────────────────────────────────────────────────── */
 
-/* Longest prefix of `buf` that ends on a complete UTF-8 sequence, for a slice
- * of `n` bytes cut out of a longer file.
- *
- * A byte-count cap lands wherever it lands, and a dangling lead byte makes the
- * whole slice invalid UTF-8. yyjson will not serialize an invalid string, so
- * the request is never assembled and the file is dropped WITHOUT prose instead
- * of being analysed in part — a silent hole in the index. Measured on a 76 KiB
- * markdown file whose cut fell on the lead byte of a box-drawing glyph: the
- * file got no prose at all while every sibling did. */
-static size_t utf8_safe_prefix(const char *buf, size_t n) {
-    size_t i = 0;
-    size_t last = 0; /* end of the last sequence that completed in full */
-    while (i < n) {
-        unsigned char c = (unsigned char)buf[i];
-        size_t need = 1;
-        if (c >= 0x80) {
-            if ((c & 0xE0) == 0xC0) {
-                need = 2;
-            } else if ((c & 0xF0) == 0xE0) {
-                need = 3;
-            } else if ((c & 0xF8) == 0xF0) {
-                need = 4;
-            } else {
-                return last; /* continuation byte with no lead: malformed */
-            }
-        }
-        if (i + need > n) {
-            return last; /* the sequence runs past the cut */
-        }
-        i += need;
-        last = i;
-    }
-    return last;
-}
-
-/* Read up to `cap` bytes. When `out_total` is non-NULL it receives the file's
- * real size, which is how the caller learns the content was CUT rather than
- * merely short. */
-static char *enrich_read_file(const char *path, size_t cap, size_t *out_total) {
-    FILE *f = cbm_fopen(path, "rb");
-    if (!f) {
-        return NULL;
-    }
-    if (fseek(f, 0, SEEK_END) != 0) {
-        (void)fclose(f);
-        return NULL;
-    }
-    long size = ftell(f);
-    if (size <= 0) {
-        (void)fclose(f);
-        return NULL;
-    }
-    (void)fseek(f, 0, SEEK_SET);
-    size_t take = (size_t)size > cap ? cap : (size_t)size;
-    if (out_total) {
-        *out_total = (size_t)size;
-    }
-    char *buf = (char *)cbm_alloc(CBM_MEM_CLASS_EXTRACT, take + 1);
-    if (!buf) {
-        (void)fclose(f);
-        return NULL;
-    }
-    size_t n = fread(buf, 1, take, f);
-    (void)fclose(f);
-    if (n < (size_t)size) {
-        n = utf8_safe_prefix(buf, n); /* the cap cut mid-sequence: back off */
-    }
-    buf[n] = '\0';
-    return buf;
-}
-
-static bool enrich_write_file_mode(const char *path, const char *body, size_t len, mode_t mode) {
-    FILE *f = cbm_fopen(path, "wb");
-    if (!f) {
-        return false;
-    }
-    /* Narrow the mode BEFORE writing: a credential file that is briefly 0644
-     * with the token already in it has leaked for that window. */
-    if (mode != 0 && fchmod(cbm_fileno(f), mode) != 0) {
-        (void)fclose(f);
-        (void)remove(path);
-        return false;
-    }
-    size_t n = fwrite(body, 1, len, f);
-    bool ok = n == len;
-    ok = (fclose(f) == 0) && ok;
-    return ok;
-}
-
-static bool enrich_write_file(const char *path, const char *body, size_t len) {
-    return enrich_write_file_mode(path, body, len, 0);
-}
+/* File read/write and the model POST now live in pipeline/llm_client.{h,c}:
+ * they are shared with the cross-repository contract pass, and the POST is
+ * where the credential is handled, which is exactly the code that must not
+ * exist in two places. */
 
 /* ── the model call ─────────────────────────────────────────────────────── */
 
@@ -263,11 +270,9 @@ static bool enrich_parse_answer(const char *response_json,
         yyjson_doc *payload = start ? yyjson_read(start, strlen(start), 0) : NULL;
         yyjson_val *obj = payload ? yyjson_doc_get_root(payload) : NULL;
         if (yyjson_is_obj(obj)) {
-            static const char *const FIELDS[ENRICH_FIELD_COUNT] = {"purpose", "summary",
-                                                                   "business_context"};
             ok = true;
             for (int i = 0; i < ENRICH_FIELD_COUNT; i++) {
-                yyjson_val *v = yyjson_obj_get(obj, FIELDS[i]);
+                yyjson_val *v = yyjson_obj_get(obj, ENRICH_FIELDS[i].response_key);
                 const char *s = yyjson_is_str(v) ? yyjson_get_str(v) : NULL;
                 if (!s || !s[0]) {
                     ok = false;
@@ -286,92 +291,6 @@ static bool enrich_parse_answer(const char *response_json,
     return ok;
 }
 
-/* POST `body` to <url>/chat/completions and return the raw response. Both the
- * request and the response are files rather than argv/stdout: the body is a
- * whole source file, and the supervisor's log tail is line-oriented. */
-static char *enrich_http_post(const enrich_cfg_t *c, const char *body) {
-    const char *cache = cbm_resolve_cache_dir();
-    if (!cache || !cache[0]) {
-        return NULL;
-    }
-    char dir[CBM_PATH_MAX];
-    if (snprintf(dir, sizeof(dir), "%s/llm", cache) <= 0 || !cbm_mkdir_p(dir, 0755)) {
-        return NULL;
-    }
-
-    char sha[CBM_SHA256_HEX_LEN + 1];
-    cbm_sha256_hex(body, strlen(body), sha);
-    char req[CBM_PATH_MAX];
-    char resp[CBM_PATH_MAX];
-    char err[CBM_PATH_MAX];
-    (void)snprintf(req, sizeof(req), "%s/%s.req", dir, sha);
-    (void)snprintf(resp, sizeof(resp), "%s/%s.resp", dir, sha);
-    (void)snprintf(err, sizeof(err), "%s/%s.err", dir, sha);
-
-    if (!enrich_write_file(req, body, strlen(body))) {
-        return NULL;
-    }
-
-    size_t ulen = strlen(c->url);
-    while (ulen > 0 && c->url[ulen - 1] == '/') {
-        ulen--; /* tolerate a trailing slash on the configured base */
-    }
-
-    char timeout_s[CBM_SZ_16];
-    (void)snprintf(timeout_s, sizeof(timeout_s), "%d", (c->timeout_ms + 999) / 1000);
-    char data_arg[CBM_PATH_MAX + 1];
-    (void)snprintf(data_arg, sizeof(data_arg), "@%s", req);
-
-    /* The bearer token goes in a curl config file, NEVER on argv. /proc/<pid>/
-     * cmdline is world-readable, so `-H "Authorization: Bearer sk-..."` hands
-     * the key to every local user who runs `ps` for as long as the request
-     * lives. The config is created 0600 and unlinked as soon as the call
-     * returns, so the secret exists on disk only for the duration of the
-     * request. */
-    char cfg[CBM_PATH_MAX];
-    (void)snprintf(cfg, sizeof(cfg), "%s/%s.curl", dir, sha);
-    {
-        char cfg_body[CBM_PATH_MAX * 2 + 512];
-        int n = snprintf(cfg_body, sizeof(cfg_body),
-                         "url = \"%.*s/chat/completions\"\n"
-                         "request = \"POST\"\n"
-                         "header = \"Content-Type: application/json\"\n",
-                         (int)ulen, c->url);
-        if (n > 0 && (size_t)n < sizeof(cfg_body) && c->key[0]) {
-            n += snprintf(cfg_body + n, sizeof(cfg_body) - (size_t)n,
-                          "header = \"Authorization: Bearer %s\"\n", c->key);
-        }
-        if (n > 0 && (size_t)n < sizeof(cfg_body)) {
-            n += snprintf(cfg_body + n, sizeof(cfg_body) - (size_t)n,
-                          "data-binary = \"%s\"\noutput = \"%s\"\n", data_arg, resp);
-        }
-        if (n <= 0 || (size_t)n >= sizeof(cfg_body) ||
-            !enrich_write_file_mode(cfg, cfg_body, (size_t)n, 0600)) {
-            return NULL;
-        }
-    }
-
-    const char *argv_curl[] = {"curl", "-sS", "--fail-with-body", "--max-time", timeout_s, "-K",
-                               cfg,    NULL};
-
-    cbm_proc_opts_t opts;
-    memset(&opts, 0, sizeof(opts));
-    opts.bin = "curl";
-    opts.argv = argv_curl;
-    opts.log_file = err; /* curl's diagnostics; never the request body */
-    opts.delete_log_on_exit = true;
-    opts.quiet_timeout_ms = c->timeout_ms + 5000;
-
-    cbm_proc_result_t res;
-    memset(&res, 0, sizeof(res));
-    int run_rc = cbm_subprocess_run(&opts, &res);
-    (void)remove(cfg); /* holds the credential: drop it before anything else */
-    if (run_rc != 0 || res.outcome != CBM_PROC_CLEAN) {
-        cbm_log_info("llm_enrich.http", "outcome", cbm_proc_outcome_str(res.outcome));
-        return NULL;
-    }
-    return enrich_read_file(resp, ENRICH_RESPONSE_CAP, NULL);
-}
 
 /* Build the request body: a strict-JSON analyst prompt plus the file.
  *
@@ -398,19 +317,18 @@ static char *enrich_build_request(const enrich_cfg_t *c, const char *path, const
     yyjson_mut_obj_add_strcpy(doc, fmt, "type", "json_object");
     yyjson_mut_obj_add_val(doc, root, "response_format", fmt);
 
+    /* Cheap insurance for the models that need it; see CBM_LLM_NO_THINKING. */
+    if (c->no_thinking) {
+        yyjson_mut_val *kwargs = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_bool(doc, kwargs, "enable_thinking", false);
+        yyjson_mut_obj_add_val(doc, root, "chat_template_kwargs", kwargs);
+    }
+
     yyjson_mut_val *messages = yyjson_mut_arr(doc);
 
     yyjson_mut_val *sys = yyjson_mut_obj(doc);
     yyjson_mut_obj_add_strcpy(doc, sys, "role", "system");
-    yyjson_mut_obj_add_strcpy(
-        doc, sys, "content",
-        "You analyse one source file at a time for a code-search index. Reply with a single JSON "
-        "object and nothing else, with exactly these keys: "
-        "\"purpose\" (one sentence: what this file is for), "
-        "\"summary\" (one short paragraph: what it does and how it fits the wider codebase), "
-        "\"business_context\" (one sentence: which part of the product or workflow it serves). "
-        "Describe only what the file actually shows. Never invent behaviour, callers or intent "
-        "that is not visible in the content.");
+    yyjson_mut_obj_add_strcpy(doc, sys, "content", ENRICH_SYSTEM_PROMPT);
     yyjson_mut_arr_add_val(messages, sys);
 
     yyjson_mut_val *user = yyjson_mut_obj(doc);
@@ -449,15 +367,22 @@ static char *enrich_cache_path(const enrich_cfg_t *c, const char *path, const ch
     if (snprintf(dir, sizeof(dir), "%s/llm", cache) <= 0 || !cbm_mkdir_p(dir, 0755)) {
         return NULL;
     }
-    /* Key over the three inputs that decide the answer. Length-prefixed so a
-     * path that is a prefix of another cannot collide with a shifted content. */
-    char *key = (char *)cbm_alloc(CBM_MEM_CLASS_EXTRACT,
-                                  strlen(c->model) + strlen(path) + strlen(content) + 64);
+    /* Key over EVERY input that decides the answer: the model, the system
+     * prompt, the path and the content. The prompt belongs here. Leaving it out
+     * means a prompt edit silently reuses answers the previous prompt produced
+     * — and because those answers still parse, nothing anywhere reports it. The
+     * fix is to hash the prompt text rather than track a version number by
+     * hand; the key then cannot outlive the prompt that produced it.
+     * Length-prefixed so a path that is a prefix of another cannot collide with
+     * a shifted content. */
+    size_t cap =
+        strlen(c->model) + strlen(ENRICH_SYSTEM_PROMPT) + strlen(path) + strlen(content) + 96;
+    char *key = (char *)cbm_alloc(CBM_MEM_CLASS_EXTRACT, cap);
     if (!key) {
         return NULL;
     }
-    (void)snprintf(key, strlen(c->model) + strlen(path) + strlen(content) + 64, "%s\n%zu:%s\n%s",
-                   c->model, strlen(path), path, content);
+    (void)snprintf(key, cap, "%s\np%zu:%s\n%zu:%s\n%s", c->model, strlen(ENRICH_SYSTEM_PROMPT),
+                   ENRICH_SYSTEM_PROMPT, strlen(path), path, content);
     char sha[CBM_SHA256_HEX_LEN + 1];
     cbm_sha256_hex(key, strlen(key), sha);
     cbm_free(CBM_MEM_CLASS_EXTRACT, key);
@@ -501,7 +426,7 @@ static int enrich_call_model(const enrich_cfg_t *c, const char *repo_path,
     }
 
     size_t total = 0;
-    char *content = enrich_read_file(abs, (size_t)c->max_bytes, &total);
+    char *content = cbm_llm_read_file(abs, (size_t)c->max_bytes, &total);
     if (!content) {
         return -1; /* unreadable, empty or oversized: leave the node alone */
     }
@@ -510,7 +435,7 @@ static int enrich_call_model(const enrich_cfg_t *c, const char *repo_path,
     char *real_cache = enrich_cache_path(c, rel, content);
     char *response = NULL;
     if (real_cache) {
-        char *hit = enrich_read_file(real_cache, ENRICH_RESPONSE_CAP, NULL);
+        char *hit = cbm_llm_read_file(real_cache, CBM_LLM_RESPONSE_CAP, NULL);
         if (hit) {
             bool ok = enrich_parse_answer(hit, out);
             cbm_free(CBM_MEM_CLASS_EXTRACT, hit);
@@ -524,7 +449,7 @@ static int enrich_call_model(const enrich_cfg_t *c, const char *repo_path,
 
     char *request = enrich_build_request(c, rel, content, total);
     if (request) {
-        response = enrich_http_post(c, request);
+        response = cbm_llm_post(c->url, c->key, request, c->timeout_ms);
         /* yyjson_mut_write allocates with the C allocator, not cbm_alloc:
          * pairing it with cbm_free lands in mi_usable_size on a pointer the
          * tracked allocator does not own. Same rule as enrich_merge_props. */
@@ -541,7 +466,7 @@ static int enrich_call_model(const enrich_cfg_t *c, const char *repo_path,
              * must never look like a cache hit. */
             char tmp[CBM_PATH_MAX];
             if (snprintf(tmp, sizeof(tmp), "%s.tmp", real_cache) > 0 &&
-                enrich_write_file(tmp, response, strlen(response))) {
+                cbm_llm_write_file(tmp, response, strlen(response), 0)) {
                 (void)remove(real_cache);
                 if (rename(tmp, real_cache) != 0) {
                     (void)remove(tmp);
@@ -579,7 +504,7 @@ static char *enrich_merge_props(const char *old,
         return NULL;
     }
     for (int i = 0; i < ENRICH_FIELD_COUNT; i++) {
-        if (!yyjson_mut_obj_put(root, yyjson_mut_strcpy(md, ENRICH_KEYS[i]),
+        if (!yyjson_mut_obj_put(root, yyjson_mut_strcpy(md, ENRICH_FIELDS[i].property_key),
                                 yyjson_mut_strcpy(md, fields[i]))) {
             yyjson_mut_doc_free(md);
             return NULL;
@@ -606,7 +531,42 @@ static char *enrich_merge_props(const char *old,
  * occur. */
 static bool enrich_already_done(const cbm_gbuf_node_t *node) {
     const char *props = node ? node->properties_json : NULL;
-    return props && strstr(props, ENRICH_KEYS[ENRICH_KEY_PURPOSE]) != NULL;
+    return props && strstr(props, ENRICH_FIELDS[ENRICH_KEY_PURPOSE].property_key) != NULL;
+}
+
+/* ── parallel fetch ─────────────────────────────────────────────────────── */
+
+/* One file's outcome from the concurrent fetch stage. The prose lands here
+ * rather than in the node because writing it touches the graph buffer, and
+ * that stays on the main thread. */
+typedef struct {
+    int status; /* 0 => fields are valid */
+    char fields[ENRICH_FIELD_COUNT][ENRICH_VALUE_CAP];
+} enrich_fetch_t;
+
+typedef struct {
+    const cbm_gbuf_node_t **nodes;
+    int count;
+    const enrich_cfg_t *cfg;
+    const char *repo_path;
+    enrich_fetch_t *out;
+    atomic_int next;
+} enrich_job_t;
+
+/* Pull the next unclaimed file and call the model. Workers exit on the shared
+ * counter rather than on a fixed partition, so one slow file cannot leave a
+ * worker idle while another holds a queue. */
+static void enrich_fetch_worker(int worker_id, void *arg) {
+    (void)worker_id;
+    enrich_job_t *job = (enrich_job_t *)arg;
+    for (;;) {
+        int i = atomic_fetch_add_explicit(&job->next, 1, memory_order_relaxed);
+        if (i >= job->count) {
+            break;
+        }
+        enrich_fetch_t *slot = &job->out[i];
+        slot->status = enrich_call_model(job->cfg, job->repo_path, job->nodes[i], slot->fields);
+    }
 }
 
 /* ── the pass ───────────────────────────────────────────────────────────── */
@@ -690,11 +650,17 @@ int cbm_pipeline_pass_llm_enrich(cbm_pipeline_ctx_t *ctx) {
         }
     }
 
-    char fields[ENRICH_FIELD_COUNT][ENRICH_VALUE_CAP];
     int enriched = 0;
     int skipped = 0;
     int failed = 0;
 
+    /* Stage 1 — claim the files that still need prose, before any thread
+     * starts. Bounded by the node count, and the graph buffer is only read. */
+    const cbm_gbuf_node_t **targets =
+        cbm_alloc(CBM_MEM_CLASS_EXTRACT, (size_t)file_count * sizeof(*targets));
+    enrich_fetch_t *fetched =
+        targets ? cbm_calloc(CBM_MEM_CLASS_EXTRACT, (size_t)file_count * sizeof(*fetched)) : NULL;
+    int target_count = 0;
     for (int i = 0; i < file_count; i++) {
         const cbm_gbuf_node_t *node = files[i];
         if (!node || !node->file_path) {
@@ -704,18 +670,78 @@ int cbm_pipeline_pass_llm_enrich(cbm_pipeline_ctx_t *ctx) {
             skipped++;
             continue;
         }
-        if (enrich_call_model(&cfg, ctx->repo_path, node, fields) != 0) {
-            failed++;
-            continue;
+        if (targets) {
+            targets[target_count++] = node;
         }
-        char *merged = enrich_merge_props(node->properties_json, fields);
-        if (!merged) {
-            failed++;
-            continue;
+    }
+
+    /* Stage 2 — model calls, `concurrency` at a time. Stage 3 — merge, on the
+     * main thread. The split is what keeps this safe: every file's temp paths
+     * are keyed by sha(body) and the cache directory is thread-local, so the
+     * workers never share a file, and cbm_gbuf_node_set_properties_json is
+     * never called off the main thread, so the graph buffer needs no lock.
+     *
+     * Allocation failure degrades to the old strictly serial path over the
+     * node list rather than aborting a run that is otherwise fine. */
+    if (targets && fetched) {
+        if (target_count > 0 && cfg.concurrency > 1) {
+            enrich_job_t job = {
+                .nodes = targets,
+                .count = target_count,
+                .cfg = &cfg,
+                .repo_path = ctx->repo_path,
+                .out = fetched,
+            };
+            atomic_init(&job.next, 0);
+            cbm_parallel_for(cfg.concurrency, enrich_fetch_worker, &job,
+                             (cbm_parallel_for_opts_t){.max_workers = cfg.concurrency,
+                                                       .force_pthreads = false});
+        } else {
+            for (int i = 0; i < target_count; i++) {
+                fetched[i].status =
+                    enrich_call_model(&cfg, ctx->repo_path, targets[i], fetched[i].fields);
+            }
         }
-        (void)cbm_gbuf_node_set_properties_json((cbm_gbuf_node_t *)node, merged);
-        free(merged);
-        enriched++;
+        for (int i = 0; i < target_count; i++) {
+            if (fetched[i].status != 0) {
+                failed++;
+                continue;
+            }
+            char *merged = enrich_merge_props(targets[i]->properties_json, fetched[i].fields);
+            if (!merged) {
+                failed++;
+                continue;
+            }
+            (void)cbm_gbuf_node_set_properties_json((cbm_gbuf_node_t *)targets[i], merged);
+            free(merged);
+            enriched++;
+        }
+    } else {
+        char fields[ENRICH_FIELD_COUNT][ENRICH_VALUE_CAP];
+        for (int i = 0; i < file_count; i++) {
+            const cbm_gbuf_node_t *node = files[i];
+            if (!node || !node->file_path || enrich_already_done(node)) {
+                continue;
+            }
+            if (enrich_call_model(&cfg, ctx->repo_path, node, fields) != 0) {
+                failed++;
+                continue;
+            }
+            char *merged = enrich_merge_props(node->properties_json, fields);
+            if (!merged) {
+                failed++;
+                continue;
+            }
+            (void)cbm_gbuf_node_set_properties_json((cbm_gbuf_node_t *)node, merged);
+            free(merged);
+            enriched++;
+        }
+    }
+    if (fetched) {
+        cbm_free(CBM_MEM_CLASS_EXTRACT, fetched);
+    }
+    if (targets) {
+        cbm_free(CBM_MEM_CLASS_EXTRACT, targets);
     }
 
     char n_enriched[CBM_SZ_16];

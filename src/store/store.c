@@ -429,7 +429,8 @@ static int init_schema(cbm_store_t *s) {
     "coalesce(json_extract(properties,'$.docstring'),'') || ' ' || "    \
     "coalesce(json_extract(properties,'$.llm_purpose'),'') || ' ' || "  \
     "coalesce(json_extract(properties,'$.llm_summary'),'') || ' ' || "  \
-    "coalesce(json_extract(properties,'$.llm_business_context'),'')), '') END"
+    "coalesce(json_extract(properties,'$.llm_business_context'),'') || ' ' || " \
+    "coalesce(json_extract(properties,'$.llm_contract'),'')), '') END"
 
 /* nodes_fts.qualified_name: the QN without the C-macro fence. A macro's QN is
  * `<module>.NAME#macro` (CBM_MACRO_QN_SUFFIX in internal/cbm/cbm.h), and `#`

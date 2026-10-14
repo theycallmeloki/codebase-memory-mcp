@@ -66,6 +66,7 @@ enum {
 #include "pipeline/pipeline.h"
 #include "callable_sig.h" /* cbm_qn_callable_base_len */
 #include "pipeline/pass_cross_repo.h"
+#include "pipeline/pass_contract_link.h"
 #include "git/git_context.h"
 #include "cli/cli.h"
 #include "watcher/watcher.h"
@@ -536,9 +537,10 @@ static const tool_def_t TOOLS[] = {
      "{\"type\":\"object\",\"properties\":{\"repo_path\":{\"type\":\"string\",\"description\":"
      "\"Repository path\"},"
      "\"mode\":{\"type\":\"string\","
-     "\"enum\":[\"full\",\"moderate\",\"fast\",\"cross-repo-intelligence\"],"
+     "\"enum\":[\"full\",\"moderate\",\"fast\",\"cross-repo-intelligence\",\"contract-link\"],"
      "\"default\":\"full\",\"description\":\"full: all+semantic; moderate: "
-     "filtered+semantic; fast: filtered only; cross-repo-intelligence: link services.\"},"
+     "filtered+semantic; fast: filtered only; cross-repo-intelligence: link services; "
+     "contract-link: link files across projects that enforce the same data invariant.\"},"
      "\"target_projects\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},"
      "\"description\":\"Cross-repo targets; [\\\"*\\\"] means all.\"},"
      "\"name\":{\"type\":\"string\",\"description\":"
@@ -547,7 +549,7 @@ static const tool_def_t TOOLS[] = {
      "\"Write .codebase-memory/graph.db.zst.\"},"
      "\"async\":{\"type\":\"boolean\",\"default\":false,\"description\":"
      "\"Start the index in the background and return immediately; it keeps running if this "
-     "call is cancelled or times out. Not with status or cross-repo-intelligence. Refused for a "
+     "call is cancelled or times out. Not with status, cross-repo-intelligence or contract-link. Refused for a "
      "one-shot cli call that is the only client of a temporary daemon (run daemon start).\"},"
      "\"status\":{\"type\":\"boolean\",\"default\":false,\"description\":"
      "\"Report the running or last index job (queued/running/succeeded/failed/cancelled) "
@@ -3917,6 +3919,7 @@ enum {
     BM25_BIND_FILE = 6,
     BM25_BIND_LABEL = 7,
     BM25_BIND_EXACT = 8,
+    BM25_BIND_IDENT = 9,
     BM25_SQL_AUTO_LEN = -1,
     /* Inner FTS5 candidate cap.  SQLite can early-terminate a plain FTS5 query
      * (no JOIN/WHERE on outer table) of the form:
@@ -4184,6 +4187,21 @@ static char *bm25_render(const bm25_output_row_t *rows, int returned, int total,
 /* Run the BM25 full-text search path and return the JSON result string.
  * Returns NULL if FTS5 is unavailable or the query produced no usable tokens,
  * in which case the caller falls back to the regex-based search path. */
+
+/* FTS5 column filter that restricts a MATCH to a node's IDENTIFIER columns,
+ * leaving `body` (model-written prose plus doc comments) out. Membership in this
+ * set means the node's OWN name/qn/label/path carries the query; it does not
+ * merely talk about it. Parenthesised because bm25_build_match emits a bare OR
+ * chain. BM25_QUERY_BUF + 64 in the caller covers the 42-char wrapper. */
+static int bm25_build_identifier_match(const char *fts_query, char *out, size_t out_size) {
+    if (!fts_query || !fts_query[0] || !out) {
+        return 0;
+    }
+    int written = snprintf(out, out_size, "{name qualified_name label file_path} : (%s)",
+                           fts_query);
+    return (written > 0 && (size_t)written < out_size) ? written : 0;
+}
+
 static char *bm25_search(cbm_store_t *store, const char *project, const char *query,
                          const char *file_pattern, const char *label, int limit, int offset,
                          bool tree_format, size_t max_output_bytes) {
@@ -4196,6 +4214,9 @@ static char *bm25_search(cbm_store_t *store, const char *project, const char *qu
     if (tok_count == 0) {
         return NULL;
     }
+    char ident_query[BM25_QUERY_BUF + 64];
+    bool have_ident_query = bm25_build_identifier_match(fts_query, ident_query,
+                                                        sizeof(ident_query)) > 0;
     char *file_like = bm25_file_pattern_like(file_pattern);
 
     /* BM25 ranked query using a two-step approach to enable FTS5 early termination.
@@ -4224,6 +4245,19 @@ static char *bm25_search(cbm_store_t *store, const char *project, const char *qu
         "       (fts.base_rank "
         "        - CASE WHEN n.name = ?8 THEN 30.0 "
         "               WHEN lower(n.name) = lower(?8) THEN 20.0 ELSE 0.0 END "
+        /* Identifier tier. A node whose OWN name/qn/label/path carries the query
+         * is what was asked for; a node that merely DISCUSSES it in prose is
+         * not. Both live in one fts5 table at equal weight, so without this the
+         * prose of an entire corpus competes on equal terms with one file's
+         * identifiers: measured on the Plumbline table-core case, a behavioural
+         * query put RowSelection.ts at rank 121 of 141 although its own NAME
+         * contains the query, because neighbours' summaries repeat the words.
+         * The boost is a tier, not a filter: a prose-only hit keeps its full
+         * BM25 rank and still surfaces when no identifier match outranks it,
+         * which is the findability pass_llm_enrich exists to provide. Chosen
+         * above the exact-name tier's floor (20.0) only in combination — this
+         * value was measured, not derived; see the probe in tests/. */
+        "        - CASE WHEN ident.rowid IS NOT NULL THEN 15.0 ELSE 0.0 END "
         "        - CASE WHEN n.label IN ('Function','Method') THEN 10.0 "
         "               WHEN n.label = 'Route' THEN 8.0 "
         "               WHEN n.label IN (" CBM_SQL_TYPE_LIKE_LABELS ") THEN 5.0 "
@@ -4236,6 +4270,14 @@ static char *bm25_search(cbm_store_t *store, const char *project, const char *qu
         "    FROM nodes_fts WHERE nodes_fts MATCH ?1"
         "    ORDER BY base_rank, rowid LIMIT ?5"
         ") fts "
+        /* Bounded exactly like the outer fts subquery, so this costs one extra
+         * early-terminated FTS5 scan and never a full one. LEFT JOIN because a
+         * prose-only match must survive with no identifier twin. */
+        "LEFT JOIN ("
+        "    SELECT rowid, " BM25_WEIGHTS " AS ident_rank"
+        "    FROM nodes_fts WHERE nodes_fts MATCH ?9"
+        "    ORDER BY ident_rank, rowid LIMIT ?5"
+        ") ident ON ident.rowid = fts.rowid "
         "JOIN nodes n ON n.id = fts.rowid "
         "WHERE n.project = ?2 "
         /* Section and Module are NO LONGER excluded (#518/#519): they are the
@@ -4280,6 +4322,17 @@ static char *bm25_search(cbm_store_t *store, const char *project, const char *qu
         sqlite3_bind_null(stmt, BM25_BIND_LABEL);
     }
     sqlite3_bind_text(stmt, BM25_BIND_EXACT, query, BM25_SQL_AUTO_LEN, MCP_SQLITE_TRANSIENT);
+    /* ?9: the identifier-column match used by the ident subquery. Only the
+     * ranked query references it — the count and saturation statements describe
+     * match membership and filter mirroring, which this boost does not change.
+     * NULL makes `MATCH ?9` select nothing, so the boost goes inert rather than
+     * the statement failing to bind. */
+    if (have_ident_query) {
+        sqlite3_bind_text(stmt, BM25_BIND_IDENT, ident_query, BM25_SQL_AUTO_LEN,
+                          MCP_SQLITE_TRANSIENT);
+    } else {
+        sqlite3_bind_null(stmt, BM25_BIND_IDENT);
+    }
 
     /* Count hits within the same inner-limit window — capped at BM25_INNER_LIMIT.
      * Uses the identical subquery structure so the FTS5 early-exit applies here too. */
@@ -10046,6 +10099,157 @@ static bool cross_repo_project_lock_keys_equivalent(const char *left, const char
     return *left_cursor == *right_cursor;
 }
 
+/* Handle mode="contract-link" — link files across repositories that enforce the
+ * same data invariant. Same on-demand, cross-project shape as
+ * handle_cross_repo_mode: it reads a source index, opens peer databases
+ * directly, and writes into each. It runs no index job of its own. */
+static char *handle_contract_link_mode(cbm_mcp_server_t *srv, const char *repo_path,
+                                       const char *name_override, const char *args) {
+    (void)srv;
+    if (name_override && name_override[0] && !cbm_validate_project_name(name_override)) {
+        return cbm_mcp_text_result("invalid project name", true);
+    }
+    char *project = name_override && name_override[0] ? heap_strdup(name_override)
+                                                      : cbm_project_name_from_path(repo_path);
+    if (!project) {
+        return cbm_mcp_text_result("cannot derive project name", true);
+    }
+
+    yyjson_doc *jdoc = yyjson_read(args, strlen(args), 0);
+    yyjson_val *jroot = jdoc ? yyjson_doc_get_root(jdoc) : NULL;
+    yyjson_val *tp_arr = jroot ? yyjson_obj_get(jroot, "target_projects") : NULL;
+    if (!tp_arr || !yyjson_is_arr(tp_arr) || yyjson_arr_size(tp_arr) == 0) {
+        yyjson_doc_free(jdoc);
+        free(project);
+        return cbm_mcp_text_result(
+            "{\"error\":\"target_projects is required for contract-link mode. "
+            "Use [\\\"*\\\"] for all projects. Run list_projects to see available.\"}",
+            true);
+    }
+
+    int tp_count = (int)yyjson_arr_size(tp_arr);
+    const char **targets = malloc((size_t)tp_count * sizeof(*targets));
+    const char **lease_keys = malloc(((size_t)tp_count + 1U) * sizeof(*lease_keys));
+    if (!targets || !lease_keys) {
+        free(targets);
+        free(lease_keys);
+        yyjson_doc_free(jdoc);
+        free(project);
+        return cbm_mcp_text_result("failed to allocate contract-link leases", true);
+    }
+    size_t idx;
+    size_t max;
+    yyjson_val *val;
+    int ti = 0;
+    const char *bad = NULL;
+    yyjson_arr_foreach(tp_arr, idx, max, val) {
+        const char *t = yyjson_is_str(val) ? yyjson_get_str(val) : NULL;
+        if (!t || !t[0]) {
+            bad = "(empty)";
+            break;
+        }
+        targets[ti++] = t;
+    }
+    /* NOTE: `targets[]` borrows pointers INTO jdoc, so the document must outlive
+     * the pass. Freeing it early — as this originally did — leaves every target
+     * name dangling and the daemon dies with no response. */
+    if (bad) {
+        yyjson_doc_free(jdoc);
+        free(targets);
+        free(lease_keys);
+        free(project);
+        return cbm_mcp_text_result("invalid entry in target_projects", true);
+    }
+
+    /* PROJECT MUTATION LEASES. Not optional: the daemon holds the session's own
+     * store open, and opening a peer database for writing underneath it without
+     * a lease is what crashed the process at cbm_store_open_path_existing. The
+     * cross-repo mode takes these for exactly this reason. Keys are sorted so
+     * two concurrent runs cannot deadlock by acquiring in opposite orders. */
+    int lease_count = 0;
+    lease_keys[lease_count++] = project;
+    for (int i = 0; i < ti; i++) {
+        lease_keys[lease_count++] = targets[i];
+    }
+    qsort(lease_keys, (size_t)lease_count, sizeof(*lease_keys), cross_repo_project_lock_key_compare);
+    int unique_count = 0;
+    for (int i = 0; i < lease_count; i++) {
+        if (unique_count == 0 || !cross_repo_project_lock_keys_equivalent(
+                                     lease_keys[i], lease_keys[unique_count - 1])) {
+            lease_keys[unique_count++] = lease_keys[i];
+        }
+    }
+    lease_count = unique_count;
+
+    int held_count = 0;
+    while (held_count < lease_count && mcp_project_mutation_begin(srv, lease_keys[held_count])) {
+        held_count++;
+    }
+    bool cancelled =
+        atomic_load_explicit(&srv->pipeline_cancel_requested, memory_order_acquire) != 0;
+    if (held_count != lease_count || cancelled) {
+        while (held_count > 0) {
+            held_count--;
+            mcp_project_mutation_end(srv, lease_keys[held_count]);
+        }
+        free(targets);
+        free(lease_keys);
+        yyjson_doc_free(jdoc);
+        free(project);
+        return cbm_mcp_text_result("contract-link cancelled or blocked by active indexing", true);
+    }
+
+    cbm_contract_link_result_t res;
+    int rc = cbm_contract_link_run(project, targets, ti, &res);
+    while (held_count > 0) {
+        held_count--;
+        mcp_project_mutation_end(srv, lease_keys[held_count]);
+    }
+    yyjson_doc_free(jdoc);
+    free(targets);
+    free(lease_keys);
+    if (rc != 0) {
+        free(project);
+        return cbm_mcp_text_result("{\"error\":\"contract-link could not run\"}", true);
+    }
+
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = doc ? yyjson_mut_obj(doc) : NULL;
+    if (!doc || !root) {
+        yyjson_mut_doc_free(doc);
+        cbm_contract_link_result_free(&res);
+        free(project);
+        return cbm_mcp_text_result("failed to allocate result", true);
+    }
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_str(doc, root, "status", "success");
+    yyjson_mut_obj_add_str(doc, root, "mode", "contract-link");
+    yyjson_mut_obj_add_strcpy(doc, root, "project", project);
+    yyjson_mut_obj_add_int(doc, root, "projects_scanned", res.projects);
+    yyjson_mut_obj_add_int(doc, root, "files_with_contract", res.files_with_contract);
+    yyjson_mut_obj_add_int(doc, root, "distinct_contracts", res.distinct_contracts);
+    yyjson_mut_obj_add_int(doc, root, "groups", res.groups);
+    yyjson_mut_obj_add_int(doc, root, "shares_contract_edges", res.edges);
+    yyjson_mut_obj_add_bool(doc, root, "model_answered", res.model_answered);
+    if (res.skipped_count > 0) {
+        yyjson_mut_val *sk = yyjson_mut_arr(doc);
+        for (int i = 0; i < res.skipped_count; i++) {
+            yyjson_mut_val *o = yyjson_mut_obj(doc);
+            yyjson_mut_obj_add_strcpy(doc, o, "project",
+                                      res.skipped[i].project ? res.skipped[i].project : "?");
+            yyjson_mut_obj_add_strcpy(doc, o, "reason",
+                                      res.skipped[i].reason ? res.skipped[i].reason : "?");
+            yyjson_mut_arr_add_val(sk, o);
+        }
+        yyjson_mut_obj_add_val(doc, root, "skipped", sk);
+    }
+    char *out = yyjson_mut_write(doc, 0, NULL);
+    yyjson_mut_doc_free(doc);
+    cbm_contract_link_result_free(&res);
+    free(project);
+    return cbm_mcp_text_result(out ? out : "{}", false);
+}
+
 /* Handle mode="cross-repo-intelligence" — extract to reduce complexity. */
 static char *handle_cross_repo_mode(cbm_mcp_server_t *srv, const char *repo_path,
                                     const char *name_override, const char *args) {
@@ -11744,6 +11948,17 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
                                     allowed_root, boundary_err, sizeof(boundary_err))) {
         index_args_free(repo_path, mode_str, name_override);
         return cbm_mcp_text_result(boundary_err, true);
+    }
+
+    if (mode_str && strcmp(mode_str, "contract-link") == 0) {
+        if (async_mode) {
+            index_args_free(repo_path, mode_str, name_override);
+            return cbm_mcp_text_result(
+                "async is not supported for mode contract-link (it runs no index job)", true);
+        }
+        char *result = handle_contract_link_mode(srv, repo_path, name_override, args);
+        index_args_free(repo_path, mode_str, name_override);
+        return result;
     }
 
     if (mode_str && strcmp(mode_str, "cross-repo-intelligence") == 0) {

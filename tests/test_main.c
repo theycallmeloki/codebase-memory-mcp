@@ -1801,6 +1801,7 @@ extern void suite_pipeline_frozen(void);
 extern void suite_importance(void);
 extern void suite_pipeline_semantic_manifest_repro(void);
 extern void suite_cross_repo(void);
+extern void suite_contract_link(void);
 extern void suite_index_resilience(void);
 extern void suite_index_format(void);
 extern void suite_fqn(void);
@@ -2249,6 +2250,7 @@ int main(int argc, char **argv) {
     RUN_SELECTED_SUITE(repro_harness_cleanup);
     RUN_SELECTED_SUITE(repro_runner_filter);
     RUN_SELECTED_SUITE(cross_repo);
+    RUN_SELECTED_SUITE(contract_link);
     RUN_SELECTED_SUITE(index_resilience);
     RUN_SELECTED_SUITE(fqn);
     RUN_SELECTED_SUITE(route_canon);
