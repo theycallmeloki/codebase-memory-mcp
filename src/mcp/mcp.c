@@ -4012,6 +4012,32 @@ enum {
  * The pair 0.3 -> 1.0 was measured; intermediate values were not. */
 #define BM25_WEIGHTS "bm25(nodes_fts, 1.0, 1.0, 1.0, 1.0, 1.0)"
 
+/* Source-first tier. A behavioural question ("where is this key built?") is
+ * answered by the implementing source, not by the prose that describes it, yet
+ * docs and tests carry the same prose vocabulary and so compete on equal terms.
+ * Measured on the Plumbline cross-repo case: they were 72% of the candidate
+ * pool (db 420 rows before the tier, 116 after) and pushed every implementing
+ * file past the page the caller reads — db builder/index.ts 12 -> 4, joins.ts
+ * 15 -> 6, table RowSelection.ts 41 -> 7.
+ *
+ * A tier, not a filter: a doc or test keeps its BM25 rank and still surfaces,
+ * behind every source candidate, when nothing better is indexed. Tiering by
+ * penalty instead saturates at 4/9 gold files against this tier's 5/9, because
+ * a penalty lets a strong doc interleave back above a weak source file. */
+#define BM25_SOURCE_TIER_EXPR                                                    \
+    "(CASE WHEN n.file_path LIKE '%.md' OR n.file_path LIKE '%.mdx' "            \
+    "OR n.file_path LIKE '%.txt' OR n.file_path LIKE '%.rst' "                   \
+    "OR n.file_path LIKE '%.json' OR n.file_path LIKE '%.yml' "                  \
+    "OR n.file_path LIKE '%.yaml' OR n.file_path LIKE '%.svg' "                  \
+    "OR n.file_path LIKE '%.png' "                                               \
+    "OR n.file_path LIKE 'docs/%' OR n.file_path LIKE '%/docs/%' "               \
+    "OR n.file_path LIKE 'examples/%' OR n.file_path LIKE '%/examples/%' "       \
+    "OR n.file_path LIKE 'tests/%' OR n.file_path LIKE '%/tests/%' "             \
+    "OR n.file_path LIKE '%/test/%' OR n.file_path LIKE '%/__tests__/%' "        \
+    "OR n.file_path LIKE '%/fixtures/%' OR n.file_path LIKE '%/benchmarks/%' "   \
+    "OR n.file_path LIKE '%.test.%' OR n.file_path LIKE '%.spec.%' "             \
+    "THEN 1 ELSE 0 END)"
+
 /* Module-local SQLITE_TRANSIENT wrapper to dodge performance-no-int-to-ptr.
  * See the matching helper in src/store/store.c for the same pattern. */
 static sqlite3_destructor_type mcp_sqlite_transient(void) {
@@ -4022,10 +4048,47 @@ static sqlite3_destructor_type mcp_sqlite_transient(void) {
 }
 #define MCP_SQLITE_TRANSIENT (mcp_sqlite_transient())
 
-static int bm25_build_match(const char *query, char *out, size_t out_size) {
-    if (!query || !out || out_size < BM25_MIN_BUF) {
-        return 0;
+/* Content tokens only. FTS5 already discounts a term by rarity, but an OR chain
+ * still lets a long prose body accumulate hits on "from"/"built"/"that" until it
+ * outranks the short symbol the question is actually about. Measured on the
+ * Plumbline cross-repo case: stopwords were half of every probe (16 tokens -> 4)
+ * and the docs that matched them held the head of every page. Dropped here, not
+ * in the tokenizer, so a query made only of stopwords still searches its words. */
+static bool bm25_stopword(const char *tok, size_t len) {
+    static const char *const words[] = {
+        "a",    "an",     "and",   "any",    "are",    "as",     "at",     "be",     "been",
+        "both", "but",    "by",    "can",    "could",  "did",    "do",     "does",   "each",
+        "every","for",    "from",  "had",    "has",    "have",   "how",    "if",     "in",
+        "into", "is",     "it",    "its",    "just",   "may",    "might",  "more",   "most",
+        "much", "must",   "not",   "of",     "on",     "only",   "or",     "other",  "others",
+        "same", "should", "so",    "some",   "such",   "than",   "that",   "the",    "then",
+        "there","these",  "they",  "this",   "those",  "to",     "two",    "using",  "value",
+        "values","was",   "were",  "what",   "when",   "where",  "which",  "while",  "who",
+        "why",  "will",   "with",  "would",  "you",    "your",   "built",  "computed","derived",
+        "make", "makes",  "made",  "also",   "all"};
+    for (size_t i = 0; i < sizeof(words) / sizeof(words[0]); i++) {
+        size_t wl = strlen(words[i]);
+        if (wl != len) {
+            continue;
+        }
+        size_t j = 0;
+        for (; j < len; j++) {
+            char c = tok[j];
+            if (c >= 'A' && c <= 'Z') {
+                c = (char)(c - 'A' + 'a');
+            }
+            if (c != words[i][j]) {
+                break;
+            }
+        }
+        if (j == len) {
+            return true;
+        }
     }
+    return false;
+}
+
+static int bm25_append_tokens(const char *query, char *out, size_t out_size, bool skip_stopwords) {
     size_t pos = 0;
     int tokens = 0;
     const char *p = query;
@@ -4046,6 +4109,9 @@ static int bm25_build_match(const char *query, char *out, size_t out_size) {
         if (tok_len == 0) {
             continue;
         }
+        if (skip_stopwords && bm25_stopword(tok_start, tok_len)) {
+            continue;
+        }
         const char *sep = (tokens > 0) ? " OR " : "";
         size_t sep_len = strlen(sep);
         if (pos + sep_len + tok_len + BM25_SEP_RESERVE >= out_size) {
@@ -4059,6 +4125,19 @@ static int bm25_build_match(const char *query, char *out, size_t out_size) {
     }
     out[pos] = '\0';
     return tokens;
+}
+
+static int bm25_build_match(const char *query, char *out, size_t out_size) {
+    if (!query || !out || out_size < BM25_MIN_BUF) {
+        return 0;
+    }
+    int tokens = bm25_append_tokens(query, out, out_size, true);
+    if (tokens > 0) {
+        return tokens;
+    }
+    /* Every word was a stopword: fall back to the caller's words verbatim so the
+     * query still means something rather than matching nothing. */
+    return bm25_append_tokens(query, out, out_size, false);
 }
 
 static char *bm25_file_pattern_like(const char *file_pattern) {
@@ -4359,7 +4438,7 @@ static char *bm25_search(cbm_store_t *store, const char *project, const char *qu
         "       ESCAPE '\\') "
         /* rank ties are common (boosted floats) — the id tie-break makes
          * offset pages contractually stable across calls. */
-        "ORDER BY rank, n.id "
+        "ORDER BY " BM25_SOURCE_TIER_EXPR ", rank, n.id "
         "LIMIT ?3 OFFSET ?4";
 
     sqlite3_stmt *stmt = NULL;
@@ -4420,7 +4499,7 @@ static char *bm25_search(cbm_store_t *store, const char *project, const char *qu
             /* MIRRORS the ranked query's filter verbatim — same weights, same
              * label exclusions. Changing one alone reports a total that does
              * not describe the rows returned. */
-            "      AND n.label NOT IN ('File','Folder','Variable','Project')"
+            "      AND n.label NOT IN ('Folder','Variable','Project')"
             "      AND (?6 IS NULL OR n.file_path LIKE ?6)"
             "      AND (?7 IS NULL OR n.label = ?7)"
             "      AND (?9 IS NULL OR (CASE WHEN json_valid(n.properties) "
